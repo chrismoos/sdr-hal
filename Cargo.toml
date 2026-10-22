@@ -1,0 +1,95 @@
+[package]
+name = "sdr-hal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+description = "Protocol-neutral SDR IQ interfaces, drivers, DSP and remote radio service."
+repository = "https://github.com/chrismoos/sdr-hal"
+documentation = "https://docs.rs/sdr-hal"
+readme = "README.md"
+keywords = ["sdr", "radio", "iq", "usrp", "dsp"]
+categories = ["hardware-support", "science"]
+authors.workspace = true
+exclude = [".github", ".gitignore", "rust-toolchain.toml", "LICENSE-MIT"]
+
+[package.metadata.docs.rs]
+features = ["config", "daemon", "dsp", "file", "memory", "network-backend", "uhd-backend", "lime-backend", "bladerf-backend"]
+
+[workspace]
+resolver = "2"
+members = ["bindings/uhd", "bindings/uhd-sys", "bindings/limesuite", "bindings/limesuite-sys", "bindings/bladerf", "bindings/bladerf-sys", "soapy"]
+default-members = ["."]
+
+[workspace.package]
+authors = ["Chris Moos"]
+
+[features]
+default = []
+uhd-backend = ["dep:uhd", "dep:parking_lot"]
+lime-backend = ["dep:limesuite"]
+bladerf-backend = ["dep:bladerf"]
+soapy-backend = ["dep:soapysdr"]
+network-backend = ["dep:parking_lot", "dep:socket2", "dep:tokio", "dep:tonic", "dep:prost", "dep:crossbeam-channel", "dep:tonic-build"]
+dsp = []
+memory = []
+tools = ["config", "dep:clap", "dep:env_logger", "dep:tokio"]
+file = ["dep:hound"]
+daemon = ["network-backend", "config", "dsp", "dep:parking_lot", "dep:tokio-stream", "dep:clap", "dep:env_logger"]
+config = ["dep:serde_json", "dep:serde_yaml"]
+
+[dependencies]
+num-complex = "0.4"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+uhd = { package = "sdr-hal-uhd", path = "bindings/uhd", version = "0.1.0", optional = true }
+limesuite = { package = "sdr-hal-limesuite", path = "bindings/limesuite", version = "0.1.0", optional = true }
+bladerf = { package = "sdr-hal-bladerf", path = "bindings/bladerf", version = "0.1.0", optional = true }
+soapysdr = { version = "0.5", optional = true }
+hound = { version = "3", optional = true }
+parking_lot = { version = "0.12", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+socket2 = { version = "0.6.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"], optional = true }
+tonic = { version = "0.13", optional = true }
+prost = { version = "0.13", optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
+serde_json = { version = "1", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[build-dependencies]
+tonic-build = { version = "0.13", optional = true }
+
+[[bin]]
+name = "sdr-radiod"
+path = "src/bin/sdr-radiod.rs"
+required-features = ["daemon"]
+
+[[bin]]
+name = "sdr-bench"
+path = "src/bin/sdr-bench.rs"
+required-features = ["tools"]
+
+[[example]]
+name = "iq_roundtrip"
+required-features = ["memory"]
+
+[[test]]
+name = "network_loopback"
+required-features = ["daemon"]
+
+[[test]]
+name = "composite_daemon"
+required-features = ["daemon"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

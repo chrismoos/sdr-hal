@@ -1,0 +1,33 @@
+[package]
+name = "sdr-hal-uhd"
+version = "0.1.0"
+authors.workspace = true
+edition = "2021"
+description = "Safe Rust bindings to the UHD library for USRP devices"
+repository = "https://github.com/chrismoos/sdr-hal"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["sdr", "usrp", "radio"]
+categories = ["hardware-support"]
+
+
+[lib]
+name = "uhd"
+
+[dependencies]
+num-complex = "0.4.0"
+libc = "0.2"
+thiserror = "1.0.24"
+anyhow = "1.0.39"
+
+[dependencies.uhd-sys]
+package = "sdr-hal-uhd-sys"
+version = "0.1.0"
+path = "../uhd-sys"
+
+[dev-dependencies]
+log = "0.4.13"
+env_logger = "0.11.0"
+
+[lints]
+workspace = true

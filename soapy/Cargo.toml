@@ -1,0 +1,26 @@
+[package]
+name = "sdr-hal-soapy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+description = "C interface behind the SoapySDR module for sdr-radiod network radios."
+authors.workspace = true
+publish = false
+
+[lib]
+name = "sdr_hal_soapy"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+sdr-hal = { path = "..", version = "0.1.0", features = ["network-backend"] }
+num-complex = "0.4"
+log = "0.4"
+parking_lot = "0.12"
+
+[dev-dependencies]
+sdr-hal = { path = "..", version = "0.1.0", features = ["network-backend", "daemon"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

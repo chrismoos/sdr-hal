@@ -1,0 +1,18 @@
+{
+  "kind": "uhd",
+  "device": "type=b200,num_recv_frames=1024,num_send_frames=1024",
+  "channel": 0,
+  "antenna": "TX/RX",
+  "tx_gain_db": 65.0,
+  "tx_max_gain_db": 89.75,
+  "tx_max_gain_power_estimate_dbm": 18.75,
+  "master_clock_rate": 32000000,
+  "rx_antenna": "RX2",
+  "rx_gain_db": 30.0,
+  "rx_max_gain_db": 76.0,
+  "rx_max_gain_reference_dbm": -65.0,
+  "tx_sample_rate_hz": 2000000,
+  "tx_bandwidth_hz": 2000000,
+  "rx_sample_rate_hz": 2000000,
+  "rx_bandwidth_hz": 2000000
+}

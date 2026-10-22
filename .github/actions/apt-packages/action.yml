@@ -1,0 +1,24 @@
+name: apt packages
+description: Installs Debian packages, using sudo only when the job does not already run as root.
+
+inputs:
+  packages:
+    description: Package names to install, space separated.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        if [ "$(id -u)" -eq 0 ]; then
+          privileged() { env DEBIAN_FRONTEND=noninteractive "$@"; }
+        else
+          privileged() { sudo env DEBIAN_FRONTEND=noninteractive "$@"; }
+        fi
+        privileged apt-get update
+        privileged apt-get install -y $PACKAGES

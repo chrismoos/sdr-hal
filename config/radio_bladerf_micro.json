@@ -1,0 +1,17 @@
+{
+  "kind": "blade_rf",
+  "device": "",
+  "channel": 0,
+  "tx_antenna": "TXA",
+  "tx_gain_db": 60,
+  "rx_antenna": "A_BALANCED",
+  "rx_gain_db": 30,
+  "num_buffers": 16,
+  "buffer_size": 8192,
+  "num_transfers": 8,
+  "stream_timeout_ms": 3500,
+  "tx_sample_rate_hz": 2000000,
+  "tx_bandwidth_hz": 2000000,
+  "rx_sample_rate_hz": 2000000,
+  "rx_bandwidth_hz": 2000000
+}

@@ -1,0 +1,13 @@
+{
+  "kind": "lime",
+  "device": "",
+  "channel": 0,
+  "tx_antenna": "BAND1",
+  "tx_gain_db": 60,
+  "rx_antenna": "LNAW",
+  "rx_gain_db": 40,
+  "tx_sample_rate_hz": 2000000,
+  "tx_bandwidth_hz": 2000000,
+  "rx_sample_rate_hz": 2000000,
+  "rx_bandwidth_hz": 2000000
+}

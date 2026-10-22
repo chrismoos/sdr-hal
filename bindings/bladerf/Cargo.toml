@@ -1,0 +1,23 @@
+[package]
+name = "sdr-hal-bladerf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+description = "Safe Rust bindings to the libbladeRF library for bladeRF devices"
+readme = "README.md"
+repository = "https://github.com/chrismoos/sdr-hal"
+keywords = ["sdr", "bladerf", "radio"]
+categories = ["api-bindings", "hardware-support"]
+
+[lib]
+name = "bladerf"
+
+[dependencies]
+bladerf-sys = { package = "sdr-hal-bladerf-sys", version = "0.1.0", path = "../bladerf-sys" }
+num-complex = "0.4"
+thiserror = "1"
+log = "0.4"
+
+[lints]
+workspace = true

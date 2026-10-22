@@ -1,0 +1,13 @@
+{
+  "kind": "soapy",
+  "device": "driver=plutosdr",
+  "channel": 0,
+  "antenna": "A",
+  "tx_gain_db": 65.0,
+  "rx_antenna": "A_BALANCED",
+  "rx_gain_db": 35.0,
+  "tx_sample_rate_hz": 2000000,
+  "tx_bandwidth_hz": 2000000,
+  "rx_sample_rate_hz": 2000000,
+  "rx_bandwidth_hz": 2000000
+}

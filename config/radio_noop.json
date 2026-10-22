@@ -1,0 +1,4 @@
+{
+  "kind": "noop",
+  "tx_sample_rate_hz": 2000000
+}

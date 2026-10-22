@@ -1,0 +1,6 @@
+{
+  "kind": "file_output",
+  "path": "iq_out.wav",
+  "tx_sample_rate_hz": 2000000,
+  "tx_bandwidth_hz": 2000000
+}

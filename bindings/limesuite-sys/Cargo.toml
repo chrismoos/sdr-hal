@@ -1,0 +1,26 @@
+[package]
+name = "sdr-hal-limesuite-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+description = "Low-level bindings to the LimeSuite library for LimeSDR devices"
+readme = "README.md"
+repository = "https://github.com/chrismoos/sdr-hal"
+keywords = ["sdr", "limesdr", "limesuite"]
+categories = ["external-ffi-bindings", "hardware-support"]
+links = "LimeSuite"
+build = "build.rs"
+
+[lib]
+name = "limesuite_sys"
+doctest = false
+
+[dependencies]
+
+[build-dependencies]
+pkg-config = "0.3"
+bindgen = "0.72"
+
+[lints]
+workspace = true

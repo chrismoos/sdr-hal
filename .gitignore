@@ -1,0 +1,8 @@
+/target/
+*.local.json
+*.local.yaml
+*.local.yml
+build/
+*.swp
+*.swo
+.*.sw?

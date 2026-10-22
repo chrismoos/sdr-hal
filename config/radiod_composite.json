@@ -1,0 +1,12 @@
+{
+  "listen": "0.0.0.0:50710",
+  "data_listen": "0.0.0.0:50711",
+  "composite": {
+    "device_rate_hz": 9720000,
+    "tx_center_hz": 864945000,
+    "rx_center_hz": 819945000,
+    "tx_digital_backoff_db": -12.0,
+    "block_duration_ms": 2.0,
+    "tx_deadline_ms": 5.0
+  }
+}

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  portable:
+    name: features ${{ matrix.features || '(none)' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: default
+            features: ""
+          - slug: config
+            features: "config"
+          - slug: file
+            features: "file"
+          - slug: memory
+            features: "memory"
+          - slug: dsp
+            features: "dsp"
+          - slug: network-backend
+            features: "network-backend"
+          - slug: daemon
+            features: "daemon"
+          - slug: tools
+            features: "tools"
+          - slug: combined
+            features: "config,file,memory,dsp"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - uses: ./.github/actions/apt-packages
+        with:
+          packages: protobuf-compiler
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: portable-${{ matrix.slug }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: portable-${{ matrix.slug }}-
+      - name: Test and lint
+        env:
+          SDR_FEATURES: ${{ matrix.features }}
+        run: |
+          selected=(--locked --no-default-features)
+          if [ -n "$SDR_FEATURES" ]; then
+            selected+=(--features "$SDR_FEATURES")
+          fi
+          cargo test --release -p sdr-hal "${selected[@]}"
+          cargo clippy --release -p sdr-hal --all-targets "${selected[@]}" -- -D warnings
+
+  native:
+    name: all features with native SDKs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - uses: ./.github/actions/apt-packages
+        with:
+          packages: >-
+            libuhd-dev liblimesuite-dev libbladerf-dev libsoapysdr-dev
+            libclang-dev protobuf-compiler pkg-config
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: native-${{ hashFiles('Cargo.lock') }}
+          restore-keys: native-
+      - run: cargo build --release --locked --workspace --all-targets --all-features
+      - run: cargo clippy --release --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --release --locked --workspace --all-features
+      - run: cargo doc --locked -p sdr-hal --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

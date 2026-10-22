@@ -1,0 +1,37 @@
+name: Rust toolchain
+description: Installs the toolchain named in rust-toolchain.toml, bootstrapping rustup when the runner image has none.
+
+inputs:
+  components:
+    description: Extra components to install with the toolchain, space separated.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install the pinned toolchain
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -euo pipefail
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+        if [ -z "$channel" ]; then
+          echo "rust-toolchain.toml names no channel" >&2
+          exit 1
+        fi
+        args=(--profile minimal)
+        for component in $COMPONENTS; do
+          args+=(--component "$component")
+        done
+        rustup toolchain install "$channel" "${args[@]}"
+        rustup default "$channel"
+        rustc --version
+        cargo --version

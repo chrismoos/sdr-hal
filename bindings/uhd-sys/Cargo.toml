@@ -1,0 +1,26 @@
+[package]
+name = "sdr-hal-uhd-sys"
+version = "0.1.0"
+authors.workspace = true
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Low-level FFI bindings to the UHD library for USRP devices"
+repository = "https://github.com/chrismoos/sdr-hal"
+readme = "README.md"
+keywords = ["sdr"]
+categories = ["external-ffi-bindings", "hardware-support"]
+links = "uhd"
+build = "build.rs"
+
+[lib]
+name = "uhd_sys"
+doctest = false
+
+[dependencies]
+
+[build-dependencies]
+pkg-config = "0.3"
+bindgen = "0.72"
+
+[lints]
+workspace = true

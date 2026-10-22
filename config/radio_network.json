@@ -1,0 +1,12 @@
+{
+  "kind": "network",
+  "addr": "127.0.0.1:50710",
+  "data_host": "127.0.0.1",
+  "samples_per_packet": 2200,
+  "transport": "tcp",
+  "rx_enabled": true,
+  "tx_sample_rate_hz": 2000000,
+  "tx_bandwidth_hz": 2000000,
+  "rx_sample_rate_hz": 2000000,
+  "rx_bandwidth_hz": 2000000
+}

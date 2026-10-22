@@ -1,0 +1,227 @@
+syntax = "proto3";
+package radio.v1;
+
+import "google/protobuf/empty.proto";
+
+// Hardware timestamps are native device ticks. RadioInfo.tick_rate gives ticks per second.
+service RadioControlService {
+  // Returns backend capabilities and calibration.
+  rpc GetInfo(google.protobuf.Empty) returns (RadioInfo);
+  // Sets TX center frequency in Hz, including an open stream.
+  rpc SetTxFrequency(SetTxFrequencyRequest) returns (google.protobuf.Empty);
+  // Sets the final TX rate and returns the applied rate. Changing the rate requires an unopened session.
+  rpc SetTxSampleRate(SetTxSampleRateRequest) returns (SetTxSampleRateResponse);
+  // Sets the device clock rate that timestamps count in and returns the applied rate.
+  // Requires an unopened session, and clears any negotiated sample rate because the
+  // achievable rates follow this clock. Backends whose clock follows the sample rate
+  // reject a change.
+  rpc SetTickRate(SetTickRateRequest) returns (SetTickRateResponse);
+  // Sets TX gain in dB and returns the applied gain, before or during a session.
+  // A composite server records the request without applying it.
+  rpc SetTxGain(SetTxGainRequest) returns (SetTxGainResponse);
+  // Sets TX filter bandwidth. Changing the bandwidth requires an unopened session.
+  rpc SetTxBandwidth(SetTxBandwidthRequest) returns (google.protobuf.Empty);
+  // Sets compensated TX LO displacement. Changing the offset requires an unopened session.
+  rpc SetTxLoOffset(SetTxLoOffsetRequest) returns (google.protobuf.Empty);
+  // Configures RX and returns the applied sample rate. Tune the split RX stream with SetRxFrequency before activation.
+  rpc SetupRx(SetupRxRequest) returns (SetupRxResponse);
+  // Retunes the open RX stream in Hz.
+  rpc SetRxFrequency(SetRxFrequencyRequest) returns (google.protobuf.Empty);
+  // Sets gain in dB on the open RX stream.
+  rpc SetRxGain(SetRxGainRequest) returns (google.protobuf.Empty);
+  // Splits the configured device into stream workers and negotiates IQ framing.
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  // Reads device time in ticks, before or during a session.
+  rpc GetHardwareTime(google.protobuf.Empty) returns (HardwareTime);
+  // Resets device time in ticks if the backend supports it.
+  rpc SetHardwareTime(HardwareTime) returns (google.protobuf.Empty);
+  // Enables or stops TX. Optional time support depends on the backend.
+  rpc EnableTransmit(EnableTransmitRequest) returns (google.protobuf.Empty);
+  // Activates RX at an optional device time. Unsupported scheduled activation returns an error.
+  rpc RxActivate(RxActivateRequest) returns (google.protobuf.Empty);
+  // Stops the open RX stream.
+  rpc RxStop(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
+// Independent operations advertised by a radio backend.
+enum RadioCapability {
+  // No operation is advertised. This value does not indicate support.
+  RADIO_CAPABILITY_UNSPECIFIED = 0;
+  // RX can be configured. The stream need not be prepared or active.
+  RADIO_CAPABILITY_RECEIVE = 1;
+  // The first TX sample can be scheduled against the device clock.
+  RADIO_CAPABILITY_TIMED_TX_SAMPLES = 2;
+  // TX activation itself can be scheduled, independently of timed IQ.
+  RADIO_CAPABILITY_TIMED_TX_ACTIVATION = 3;
+  // The clock epoch can be reset, changing the interpretation of queued timestamps.
+  RADIO_CAPABILITY_CLOCK_RESET = 4;
+  // Final-sample metadata finishes a burst while keeping stream resources ready.
+  RADIO_CAPABILITY_TX_BURST_END = 5;
+}
+
+// Backend capabilities and optional gain-dependent calibration.
+message RadioInfo {
+  // Device clock ticks per second. Timestamps on this session use this rate.
+  uint64 tick_rate = 1;
+  // Maximum IQ packet sample count supported by the server.
+  uint32 max_samples_per_packet = 2;
+  // Server-provided backend name.
+  string backend = 3;
+  // Connector power for unit-RMS TX samples at the server's configured gain.
+  optional double tx_full_scale_power_estimate_dbm = 4;
+  // Input power that corresponds to 0 dBFS at the server's configured RX gain.
+  optional double rx_reference_dbm = 5;
+  // Signed correction relative to the RX sample timeline. Positive nanoseconds schedule TX later.
+  // Add once to an RX-relative target time to obtain the TX timestamp, in nanoseconds.
+  // The server reports this calibration without applying it to IQ or timestamps.
+  optional int64 rx_to_tx_delay_ns = 6;
+  // Applied TX sample rate in Hz, including changes from shared-clock RX setup.
+  optional double actual_tx_sample_rate_hz = 7;
+  // Applied RX sample rate in Hz. Absent before RX setup.
+  optional double actual_rx_sample_rate_hz = 8;
+  // Supported operations. Multiple entries can be present. Unknown entries can be ignored.
+  repeated RadioCapability capabilities = 9;
+  // Accepted client TX sample rates in Hz. Absent means no limit beyond the device.
+  optional ValueRange tx_sample_rate_range = 10;
+  // Accepted client RX sample rates in Hz.
+  optional ValueRange rx_sample_rate_range = 11;
+  // Accepted TX center frequencies in Hz.
+  optional ValueRange tx_frequency_range = 12;
+  // Accepted RX center frequencies in Hz.
+  optional ValueRange rx_frequency_range = 13;
+  // Settable TX gain in dB. Absent when clients cannot set TX gain.
+  optional ValueRange tx_gain_range = 14;
+  // Applied TX gain in dB. Absent when clients cannot set TX gain.
+  optional double tx_gain_db = 15;
+}
+
+// Inclusive range, in Hz for rates and frequencies and in dB for gain.
+message ValueRange {
+  // Lowest accepted value.
+  double minimum = 1;
+  // Highest accepted value.
+  double maximum = 2;
+}
+
+// TX center-frequency setting before or during an open session.
+message SetTxFrequencyRequest {
+  // Requested center frequency in Hz.
+  uint64 frequency_hz = 1;
+}
+
+// Final-rate TX IQ request. A rate must be configured before opening a session.
+message SetTxSampleRateRequest {
+  reserved 1;
+  // Requested final IQ sample rate in Hz. Fractional rates are allowed.
+  double sample_rate_hz = 2;
+}
+
+// Applied TX rate after driver coercion.
+message SetTxSampleRateResponse {
+  // Applied final IQ sample rate in Hz. Use this rate for sample-to-time conversion.
+  double actual_sample_rate_hz = 1;
+}
+
+// TX gain request.
+message SetTxGainRequest {
+  // TX hardware gain in dB.
+  double gain_db = 1;
+}
+
+// Applied TX gain after driver coercion.
+message SetTxGainResponse {
+  // Applied TX hardware gain in dB.
+  double actual_gain_db = 1;
+}
+
+// Device clock rate request. An open session accepts only the existing value.
+message SetTickRateRequest {
+  // Requested device clock ticks per second.
+  uint64 tick_rate = 1;
+}
+
+// Applied device clock rate after driver coercion.
+message SetTickRateResponse {
+  // Applied device clock ticks per second.
+  uint64 actual_tick_rate = 1;
+}
+
+// TX analog filter bandwidth request. An open session accepts only the existing value.
+message SetTxBandwidthRequest {
+  // Requested analog filter bandwidth in Hz.
+  uint64 bandwidth_hz = 1;
+}
+
+// TX LO displacement request with backend digital compensation. An open session accepts only the existing value.
+message SetTxLoOffsetRequest {
+  // Signed LO displacement in Hz.
+  int64 offset_hz = 1;
+}
+
+// RX stream configuration in Hz. Preparation does not tune the receiver. An open session keeps its channel, antenna, rate, and bandwidth.
+message SetupRxRequest {
+  // Zero-based hardware RX channel.
+  uint32 channel = 1;
+  // Native RX port name. Empty uses the server default.
+  string antenna = 2;
+  // Requested final IQ sample rate in Hz.
+  double sample_rate_hz = 3;
+  // Requested analog filter bandwidth in Hz.
+  double bandwidth_hz = 4;
+  // RX hardware gain in dB. When optional, absence uses the server default.
+  optional double gain_db = 5;
+}
+
+// RX retune request for the active stream.
+message SetRxFrequencyRequest {
+  // Requested center frequency in Hz.
+  double frequency_hz = 1;
+}
+
+// RX gain setting for the active stream.
+message SetRxGainRequest {
+  // RX hardware gain in dB.
+  double gain_db = 1;
+}
+
+// IQ session request. TX rate must already be configured.
+message OpenSessionRequest {
+  // Complex samples per IQ packet. The server clamps the negotiated count.
+  uint32 samples_per_packet = 1;
+}
+
+// Negotiated IQ endpoint and session identity.
+message OpenSessionResponse {
+  // Server-issued token that every IQ packet must include.
+  uint32 session_id = 1;
+  // IQ port shared by TCP and UDP.
+  uint32 data_port = 2;
+  // Complex samples per IQ packet. The server clamps the negotiated count.
+  uint32 samples_per_packet = 3;
+}
+
+// Device clock value in native ticks.
+message HardwareTime {
+  // Device-clock ticks.
+  uint64 time_ticks = 1;
+}
+
+// TX stream enable or stop request with optional scheduling metadata.
+message EnableTransmitRequest {
+  // True enables TX. False stops TX.
+  bool enable = 1;
+  // Device-clock ticks. When optional, absence requests immediate activation.
+  optional uint64 time_ticks = 2;
+}
+
+// RX activation request with optional scheduling metadata.
+message RxActivateRequest {
+  // Device-clock ticks. When optional, absence requests immediate activation.
+  optional uint64 time_ticks = 1;
+}
+
+// Applied RX sample rate after driver coercion.
+message SetupRxResponse {
+  // Applied final IQ sample rate in Hz. Use this rate for sample-to-time conversion.
+  double actual_sample_rate_hz = 1;
+}
