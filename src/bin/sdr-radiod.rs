@@ -20,11 +20,20 @@ struct Args {
     radio_config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), sdr_hal::error::Error> {
+fn main() -> Result<(), sdr_hal::error::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     let config = RadiodConfig::load_from_path(&args.config)?;
+    sdr_hal::daemon::realtime::configure(config.realtime);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(sdr_hal::daemon::realtime::apply_control)
+        .build()?;
+    sdr_hal::daemon::realtime::apply_control();
+    runtime.block_on(run(args, config))
+}
+
+async fn run(args: Args, config: RadiodConfig) -> Result<(), sdr_hal::error::Error> {
     let mut radio_config = RadioConfig::load(&args.radio_config)?;
     if matches!(radio_config.device, DeviceConfig::Network { .. }) {
         return Err("radiod requires a local radio backend, not another network radio".into());

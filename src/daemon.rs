@@ -14,3 +14,5 @@ mod sessions;
 pub use composite::CompositeConfig;
 pub use config::RadiodConfig;
 pub use service::{RadioCalibration, RxDefaults, serve};
+
+pub mod realtime;

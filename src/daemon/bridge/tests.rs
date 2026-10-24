@@ -219,3 +219,77 @@ fn silence_watchdog_fires_only_while_armed_and_quiet() {
     watchdog.note_samples(start);
     assert_eq!(watchdog.expired(start + TX_SILENCE_TIMEOUT * 4), None);
 }
+
+#[test]
+fn a_continuous_packet_backlog_cannot_extend_the_silence_deadline_indefinitely() {
+    let start = Instant::now();
+    let mut wait = BacklogWait::default();
+    assert!(wait.defer_missing(TX_PACKET_BATCH_LIMIT + 1, start));
+    assert!(wait.defer_missing(TX_PACKET_BATCH_LIMIT, start + COMPOSITE_BACKLOG_GRACE / 2));
+    assert!(!wait.defer_missing(TX_PACKET_QUEUE_CAPACITY, start + COMPOSITE_BACKLOG_GRACE));
+    assert!(!wait.defer_missing(
+        TX_PACKET_QUEUE_CAPACITY,
+        start + COMPOSITE_BACKLOG_GRACE * 2
+    ));
+    assert!(!wait.defer_missing(0, start + COMPOSITE_BACKLOG_GRACE * 2));
+    assert!(wait.defer_missing(1, start + COMPOSITE_BACKLOG_GRACE * 3));
+}
+
+#[test]
+fn packets_queued_beyond_one_batch_fill_the_grid_before_silence_is_committed() {
+    use crate::daemon::composite::{CompositeConfig, Direction, Staged};
+
+    const DEVICE_RATE: u64 = 3_888_000;
+    const CLIENT_RATE: f64 = 388_800.0;
+    const CENTER: u64 = 867_520_000;
+    const BLOCK_SAMPLES: usize = 3240;
+    const BLOCK_INDEX: u64 = 10;
+    const BACKLOG_PACKETS: usize = TX_PACKET_BATCH_LIMIT + 108;
+    let config = CompositeConfig {
+        device_rate_hz: DEVICE_RATE,
+        tx_center_hz: CENTER,
+        rx_center_hz: CENTER,
+        tx_digital_backoff_db: 0.0,
+        block_duration_ms: 5.0 / 6.0,
+        tx_deadline_ms: 2.0,
+    };
+    let plan = config
+        .plan_slice(Direction::Tx, CLIENT_RATE, CENTER, Some(30_000))
+        .unwrap();
+    let make_grid = || {
+        let mut grid = TxGrid::new(DEVICE_RATE, DEVICE_RATE, BLOCK_SAMPLES).unwrap();
+        grid.add_slot(&plan, DEVICE_RATE, 1.0);
+        grid.add_slot(&plan, DEVICE_RATE, 1.0);
+        grid
+    };
+    let mut grid = make_grid();
+    let mut reference = make_grid();
+    let samples = vec![Complex32::new(0.25, 0.0); BLOCK_SAMPLES / plan.ratio];
+    let ticks = BLOCK_INDEX * grid.block_ticks();
+    for slot in 0..2 {
+        reference.stage(slot, ticks, &samples);
+    }
+    grid.stage(0, ticks, &samples);
+    let now = Instant::now();
+    let mut wait = BacklogWait::default();
+    let queued = BACKLOG_PACKETS - TX_PACKET_BATCH_LIMIT;
+    let deadline = (!wait.defer_missing(queued, now)).then_some(BLOCK_INDEX);
+    assert!(
+        grid.emit_available(BLOCK_INDEX, deadline, |_| true)
+            .is_none()
+    );
+    assert!(matches!(
+        grid.stage(1, ticks, &samples),
+        Staged::Placed { .. }
+    ));
+    let deadline =
+        (!wait.defer_missing(queued, now + COMPOSITE_BACKLOG_GRACE / 2)).then_some(BLOCK_INDEX);
+    let actual = grid
+        .emit_available(BLOCK_INDEX, deadline, |_| true)
+        .unwrap();
+    let expected = reference
+        .emit_available(BLOCK_INDEX, Some(BLOCK_INDEX), |_| true)
+        .unwrap();
+    assert_eq!(actual.time_ticks, expected.time_ticks);
+    assert_eq!(actual.samples, expected.samples);
+}

@@ -12,6 +12,10 @@ pub const DEFAULT_CONTROL_PORT: u16 = 50710;
 /// Default IQ port, shared by UDP and TCP listeners.
 pub const DEFAULT_DATA_PORT: u16 = 50711;
 
+fn default_realtime() -> bool {
+    true
+}
+
 fn default_listen() -> SocketAddr {
     SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -33,6 +37,9 @@ fn default_data_listen() -> SocketAddr {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadiodConfig {
+    /// Defaults to enabled. OS scheduling failures are logged and do not prevent startup.
+    #[serde(default = "default_realtime")]
+    pub realtime: bool,
     /// Control TCP bind address. Defaults to all IPv4 interfaces on port 50710.
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
@@ -76,6 +83,9 @@ mod tests {
         assert_eq!(config.listen, default_listen());
         assert_eq!(config.data_listen, default_data_listen());
         assert!(config.composite.is_none());
+        assert!(config.realtime);
+        let disabled: RadiodConfig = serde_json::from_str(r#"{"realtime": false}"#).unwrap();
+        assert!(!disabled.realtime);
 
         // The rate moved to the client, so a file that still names one is a stale config
         // rather than a harmless extra key.

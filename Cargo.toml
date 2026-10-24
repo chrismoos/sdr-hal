@@ -35,10 +35,14 @@ dsp = []
 memory = []
 tools = ["config", "dep:clap", "dep:env_logger", "dep:tokio"]
 file = ["dep:hound"]
-daemon = ["network-backend", "config", "dsp", "dep:parking_lot", "dep:tokio-stream", "dep:clap", "dep:env_logger"]
+daemon = ["network-backend", "config", "dsp", "dep:parking_lot", "dep:tokio-stream", "dep:clap", "dep:env_logger", "dep:libc"]
 config = ["dep:serde_json", "dep:serde_yaml"]
 
+[workspace.dependencies]
+libc = "0.2"
+
 [dependencies]
+libc = { workspace = true, optional = true }
 num-complex = "0.4"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

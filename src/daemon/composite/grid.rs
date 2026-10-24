@@ -399,14 +399,14 @@ impl TxGrid {
     pub(crate) fn emit_available(
         &mut self,
         commit_block: u64,
-        deadline_block: u64,
+        deadline_block: Option<u64>,
         enabled: impl Fn(usize) -> bool,
     ) -> Option<GridBlock> {
         let block = self.next_block?;
         if block > commit_block {
             return None;
         }
-        if block > deadline_block
+        if deadline_block.is_none_or(|deadline| block > deadline)
             && self.slots.iter().enumerate().any(|(index, slot)| {
                 slot.live && enabled(index) && !slot.block_complete(self.block_samples)
             })
@@ -615,18 +615,24 @@ mod tests {
         let ticks = block * grid.block_ticks();
         let samples = dc(block_samples / plan.ratio);
         grid.stage(first, ticks, &samples);
-        assert!(grid.emit_available(block, block - 1, |_| true).is_none());
+        assert!(
+            grid.emit_available(block, Some(block - 1), |_| true)
+                .is_none()
+        );
         grid.stage(second, ticks, &samples);
         assert_eq!(
-            grid.emit_available(block, block - 1, |_| true)
+            grid.emit_available(block, Some(block - 1), |_| true)
                 .unwrap()
                 .time_ticks,
             ticks
         );
         let next = block + 1;
         grid.stage(first, next * grid.block_ticks(), &samples);
-        assert!(grid.emit_available(next, next - 1, |_| true).is_none());
-        assert!(grid.emit_available(next, next, |_| true).is_some());
+        assert!(
+            grid.emit_available(next, Some(next - 1), |_| true)
+                .is_none()
+        );
+        assert!(grid.emit_available(next, Some(next), |_| true).is_some());
     }
 
     #[test]

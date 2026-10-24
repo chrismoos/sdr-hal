@@ -405,7 +405,10 @@ impl RadioControlSvc {
         let tx_socket = shared.data_socket.try_clone().map_err(internal)?;
         let tx_thread = std::thread::Builder::new()
             .name("radiod-tx".into())
-            .spawn(move || tx_bridge.run(tx_half, tx_socket, tx_cmd_rx))
+            .spawn(move || {
+                super::realtime::apply_stream();
+                tx_bridge.run(tx_half, tx_socket, tx_cmd_rx)
+            })
             .map_err(internal)?;
 
         let (rx_cmds, rx_thread) = match rx_half {
@@ -428,7 +431,10 @@ impl RadioControlSvc {
                 let rx_socket = shared.data_socket.try_clone().map_err(internal)?;
                 let rx_thread = std::thread::Builder::new()
                     .name("radiod-rx".into())
-                    .spawn(move || rx_bridge.run(rx_half, rx_socket, rx_cmd_rx))
+                    .spawn(move || {
+                        super::realtime::apply_stream();
+                        rx_bridge.run(rx_half, rx_socket, rx_cmd_rx)
+                    })
                     .map_err(internal)?;
                 (Some(rx_cmds), Some(rx_thread))
             }
@@ -950,7 +956,10 @@ impl RadioControlService for RadioControlSvc {
                 let tx_socket = shared.data_socket.try_clone().map_err(internal)?;
                 let tx_thread = std::thread::Builder::new()
                     .name("radiod-tx".into())
-                    .spawn(move || tx_bridge.run(tx_half, tx_socket, tx_cmd_rx))
+                    .spawn(move || {
+                        super::realtime::apply_stream();
+                        tx_bridge.run(tx_half, tx_socket, tx_cmd_rx)
+                    })
                     .map_err(internal)?;
 
                 let rx_half = recorded.actual_rx_sample_rate_hz.and(rx_half);
@@ -970,7 +979,10 @@ impl RadioControlService for RadioControlSvc {
                         let rx_socket = shared.data_socket.try_clone().map_err(internal)?;
                         let rx_thread = std::thread::Builder::new()
                             .name("radiod-rx".into())
-                            .spawn(move || rx_bridge.run(rx_half, rx_socket, rx_cmd_rx))
+                            .spawn(move || {
+                                super::realtime::apply_stream();
+                                rx_bridge.run(rx_half, rx_socket, rx_cmd_rx)
+                            })
                             .map_err(internal)?;
                         (Some(rx_cmds), Some(rx_thread))
                     }

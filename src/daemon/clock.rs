@@ -39,6 +39,7 @@ impl ClockSampler {
         let thread = thread::Builder::new()
             .name("radiod-clock".into())
             .spawn(move || {
+                super::realtime::apply_data();
                 loop {
                     thread::park_timeout(CLOCK_REFRESH_INTERVAL);
                     if worker_stop.load(Ordering::Acquire) {

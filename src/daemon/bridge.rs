@@ -36,6 +36,7 @@ const COMMIT_LEAD_BLOCKS: u64 = 6;
 const COMMIT_CLOCK_POLL: Duration = Duration::from_millis(1);
 const TX_PACKET_QUEUE_CAPACITY: usize = 32_768;
 const TX_PACKET_BATCH_LIMIT: usize = 256;
+const COMPOSITE_BACKLOG_GRACE: Duration = Duration::from_millis(1);
 const COMPOSITE_TIMING_INTERVAL: Duration = Duration::from_secs(5);
 /// Caps each composite emit pass, so control commands are still answered when synthesis
 /// falls behind device time.
@@ -605,6 +606,21 @@ struct CompositeTxTiming {
     min_estimated_write_lead_us: Option<f64>,
 }
 
+#[derive(Default)]
+struct BacklogWait {
+    deadline: Option<Instant>,
+}
+
+impl BacklogWait {
+    fn defer_missing(&mut self, queued: usize, now: Instant) -> bool {
+        if queued == 0 {
+            self.deadline = None;
+            return false;
+        }
+        now < *self.deadline.get_or_insert(now + COMPOSITE_BACKLOG_GRACE)
+    }
+}
+
 struct SocketReaderGuard(Arc<AtomicBool>);
 
 impl Drop for SocketReaderGuard {
@@ -726,6 +742,7 @@ fn spawn_tcp_reader(
     std::thread::Builder::new()
         .name("radiod-tx-tcp".into())
         .spawn(move || {
+            super::realtime::apply_data();
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -746,6 +763,7 @@ fn spawn_tcp_reader(
                         let spawned = std::thread::Builder::new()
                             .name("radiod-tx-tcp-client".into())
                             .spawn(move || {
+                                super::realtime::apply_data();
                                 let registered =
                                     read_tcp_packets(stream, peer, &sessions, &packets, &stop);
                                 info!("radiod: data-plane TCP client {peer} went away");
@@ -794,6 +812,7 @@ fn spawn_socket_reader(
     std::thread::Builder::new()
         .name("radiod-tx-recv".into())
         .spawn(move || {
+            super::realtime::apply_data();
             let mut buf = vec![0u8; RECV_BUF_LEN];
             let mut dropped: u64 = 0;
             loop {
@@ -896,6 +915,7 @@ impl TxBridge {
         let mut last_timing_report = Instant::now();
         let mut last_loop = Instant::now();
         let mut clock_anchor = None;
+        let mut backlog_wait = BacklogWait::default();
         if slots.is_empty() {
             slots.push(TxSlotState::new(0.0));
         }
@@ -1201,8 +1221,10 @@ impl TxBridge {
             }
 
             let now = Instant::now();
+            let defer_missing =
+                self.grid.is_some() && backlog_wait.defer_missing(packets.len(), now);
             for (index, slot) in slots.iter_mut().enumerate() {
-                if let Some(block) = slot.assembler.expire(now) {
+                if !defer_missing && let Some(block) = slot.assembler.expire(now) {
                     match &mut self.grid {
                         Some(grid) => stage_block(
                             grid,
@@ -1302,9 +1324,11 @@ impl TxBridge {
                 while emit_started.elapsed() < COMPOSITE_EMIT_BUDGET {
                     let synthesis = Instant::now();
                     let Some(block) = self.grid.as_mut().and_then(|grid| {
-                        grid.emit_available(commit_block, deadline_block, |index| {
-                            slots[index].enabled
-                        })
+                        grid.emit_available(
+                            commit_block,
+                            (!defer_missing).then_some(deadline_block),
+                            |index| slots[index].enabled,
+                        )
                     }) else {
                         break;
                     };
@@ -1332,6 +1356,9 @@ impl TxBridge {
                         &TxStreamDiag::default(),
                     );
                     timing.max_write = timing.max_write.max(write.elapsed());
+                    if !packets.is_empty() {
+                        break;
+                    }
                 }
             }
 
