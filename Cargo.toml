@@ -26,7 +26,7 @@ authors = ["Chris Moos"]
 
 [features]
 default = []
-uhd-backend = ["dep:uhd", "dep:parking_lot"]
+uhd-backend = ["dep:uhd", "dep:parking_lot", "dsp"]
 lime-backend = ["dep:limesuite"]
 bladerf-backend = ["dep:bladerf"]
 soapy-backend = ["dep:soapysdr"]

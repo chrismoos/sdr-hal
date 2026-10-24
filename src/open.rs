@@ -93,6 +93,7 @@ fn open_radio(
         #[cfg(feature = "uhd-backend")]
         DeviceConfig::Uhd {
             device,
+            software_tx_frequency_correction,
             channel,
             antenna,
             tx_gain_db,
@@ -110,7 +111,8 @@ fn open_radio(
                 *master_clock_rate,
                 *max_master_clock_rate,
                 tx_sample_rate_hz,
-            )?;
+            )?
+            .with_software_tx_frequency_correction(*software_tx_frequency_correction);
             if let Some(source) = clock_source {
                 radio.set_clock_source(source)?;
             }

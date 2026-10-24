@@ -80,6 +80,10 @@ pub enum DeviceConfig {
     Uhd {
         /// Device selector passed to the driver. Use the selector syntax for that driver.
         device: String,
+        /// Requires timestamped TX and zero intentional LO offset. RF rounding is
+        /// corrected in software so hardware playback restarts do not reset its phase.
+        #[serde(default = "default_true")]
+        software_tx_frequency_correction: bool,
         /// Zero-based hardware channel index.
         channel: usize,
         /// TX antenna or port name accepted by the driver.
@@ -787,5 +791,32 @@ mod tests {
         for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(RatePolicy::Accept.check(value, REQUESTED, "TX").is_err());
         }
+    }
+
+    #[test]
+    fn uhd_software_tx_frequency_correction_defaults_on_and_can_be_disabled() {
+        let mut value = serde_json::json!({
+            "kind": "uhd",
+            "device": "type=b200",
+            "channel": 0,
+            "antenna": "TX/RX"
+        });
+        let default: DeviceConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            default,
+            DeviceConfig::Uhd {
+                software_tx_frequency_correction: true,
+                ..
+            }
+        ));
+        value["software_tx_frequency_correction"] = serde_json::json!(false);
+        let disabled: DeviceConfig = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            disabled,
+            DeviceConfig::Uhd {
+                software_tx_frequency_correction: false,
+                ..
+            }
+        ));
     }
 }

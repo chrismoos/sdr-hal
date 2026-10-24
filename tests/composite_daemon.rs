@@ -838,6 +838,31 @@ fn a_rational_client_rate_is_accepted_without_rounding() {
 }
 
 #[test]
+fn a_fractional_rx_bandwidth_is_accepted() {
+    const FRACTIONAL_RATE_HZ: f64 = DEVICE_RATE_HZ as f64 / 7.0;
+    let state = Arc::new(Mutex::new(DeviceState::default()));
+    let (_server, control) = start_server(state);
+    let mut radio = Box::new(
+        NetworkRadio::connect(&control.to_string(), NetworkRadioOptions::default()).unwrap(),
+    );
+    let applied = radio
+        .setup_rx(0, "", FRACTIONAL_RATE_HZ, FRACTIONAL_RATE_HZ, None)
+        .expect("setup rx");
+    assert!((applied - FRACTIONAL_RATE_HZ).abs() < 1e-6, "{applied}");
+}
+
+#[test]
+fn a_client_clock_request_is_ignored_and_answered_with_the_device_clock() {
+    let state = Arc::new(Mutex::new(DeviceState::default()));
+    let (_server, control) = start_server(state);
+    let mut radio = Box::new(
+        NetworkRadio::connect(&control.to_string(), NetworkRadioOptions::default()).unwrap(),
+    );
+    assert_eq!(radio.set_tick_rate(TICK_RATE * 2).unwrap(), TICK_RATE);
+    assert_eq!(radio.tick_rate(), TICK_RATE);
+}
+
+#[test]
 fn the_shared_clock_epoch_cannot_be_reset_by_a_client() {
     let state = Arc::new(Mutex::new(DeviceState::default()));
     let (_server, control) = start_server(state);

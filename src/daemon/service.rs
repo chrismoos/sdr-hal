@@ -184,6 +184,18 @@ fn whole_hz(value: f64, name: &str) -> Result<u64, Status> {
     Ok(rounded as u64)
 }
 
+/// Rounds a requested filter bandwidth down to whole Hz. A client may state a fractional
+/// bandwidth, such as its own fractional sample rate, and rounding down never widens the
+/// filter past what was asked.
+fn filter_bandwidth_hz(value: f64, name: &str) -> Result<u64, Status> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(Status::invalid_argument(format!(
+            "{name} {value} is not a usable bandwidth"
+        )));
+    }
+    Ok(value.floor() as u64)
+}
+
 /// Identifies a composite client by its control connection, since its rate, carrier and
 /// bandwidth all arrive before it has a session token.
 fn client_key<T>(request: &Request<T>) -> Result<SocketAddr, Status> {
@@ -207,6 +219,14 @@ fn ignored_device_setting(name: &str, requested: impl std::fmt::Display) {
 impl RadioControlSvc {
     fn composite(&self) -> Option<&Mutex<ClientRegistry>> {
         self.shared.composite.as_deref()
+    }
+
+    fn device_tick_rate(&self) -> Result<u64, Status> {
+        match &*self.shared.state.lock() {
+            State::Idle(idle) => Ok(idle.radio.tick_rate()),
+            State::Running(running) => Ok(running.recorded.tick_rate),
+            State::Unavailable => Err(Status::unavailable("radio unavailable")),
+        }
     }
 
     /// Grid slot a client's TX packets feed, absent until its session opens.
@@ -461,11 +481,7 @@ impl RadioControlService for RadioControlSvc {
                 minimum: minimum as f64,
                 maximum: maximum as f64,
             };
-            let tick_rate = match &*self.shared.state.lock() {
-                State::Idle(idle) => idle.radio.tick_rate(),
-                State::Running(running) => running.recorded.tick_rate,
-                State::Unavailable => return Err(Status::unavailable("radio unavailable")),
-            };
+            let tick_rate = self.device_tick_rate()?;
             let capabilities = crate::network::encode_capabilities(
                 self.shared.tx_capabilities,
                 self.shared.rx_supported,
@@ -681,9 +697,13 @@ impl RadioControlService for RadioControlSvc {
     ) -> Result<Response<proto::SetTickRateResponse>, Status> {
         let requested = request.into_inner().tick_rate;
         if self.composite().is_some() {
-            return Err(Status::failed_precondition(
-                "composite mode takes the device clock from the radio configuration, so a client cannot change it",
-            ));
+            let actual_tick_rate = self.device_tick_rate()?;
+            if requested != actual_tick_rate {
+                ignored_device_setting("the device clock", format!("{requested} Hz"));
+            }
+            return Ok(Response::new(proto::SetTickRateResponse {
+                actual_tick_rate,
+            }));
         }
         let mut state = self.shared.state.lock();
         let actual_tick_rate = match &mut *state {
@@ -745,7 +765,7 @@ impl RadioControlService for RadioControlSvc {
         if let Some(registry) = self.composite() {
             let rate = req.sample_rate_hz;
             let bandwidth = (req.bandwidth_hz > 0.0)
-                .then(|| whole_hz(req.bandwidth_hz, "RX bandwidth"))
+                .then(|| filter_bandwidth_hz(req.bandwidth_hz, "RX bandwidth"))
                 .transpose()?;
             let applied = registry
                 .lock()

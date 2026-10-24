@@ -12,6 +12,9 @@ use uhd::{
 
 use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
+mod tx_correction;
+use tx_correction::TxFrequencyCorrection;
+
 /// Callers read the clock from a streaming hot path, so time reads must not wait
 /// on a lock. UHD does not allow concurrent settings changes, so those hold
 /// `settings`.
@@ -158,6 +161,7 @@ pub struct UhdRadio {
     tx_rate_request_hz: Option<f64>,
     rx_rate_request_hz: Option<f64>,
     tx_lo_offset_hz: f64,
+    tx_correction: TxFrequencyCorrection,
     tx_streamer: Option<TransmitStreamer<Complex32>>,
     rx_streamer: Option<ReceiveStreamer<Complex32>>,
 }
@@ -241,6 +245,7 @@ impl UhdRadio {
             tx_rate_request_hz: None,
             rx_rate_request_hz: None,
             tx_lo_offset_hz: 0.0,
+            tx_correction: TxFrequencyCorrection::default(),
             tx_streamer: None,
             rx_streamer: None,
         };
@@ -253,6 +258,16 @@ impl UhdRadio {
             }
         }
         Ok(radio)
+    }
+
+    /// Select before tuning. Software correction requires timed TX and zero LO offset.
+    pub fn with_software_tx_frequency_correction(mut self, enabled: bool) -> Self {
+        self.tx_correction = if enabled {
+            TxFrequencyCorrection::software()
+        } else {
+            TxFrequencyCorrection::Hardware
+        };
+        self
     }
 
     /// Re-reads the master clock and the applied TX rate. UHD moves the master clock
@@ -366,11 +381,9 @@ impl Radio for UhdRadio {
 
     fn set_tx_frequency(&mut self, center_frequency: usize) -> Result<(), Error> {
         crate::stream::positive_hz(center_frequency as f64, "set_tx_frequency")?;
-        let request = if self.tx_lo_offset_hz != 0.0 {
-            TuneRequest::with_frequency_lo(center_frequency as f64, self.tx_lo_offset_hz)
-        } else {
-            TuneRequest::with_frequency(center_frequency as f64)
-        };
+        let request = self
+            .tx_correction
+            .tune_request(center_frequency as f64, self.tx_lo_offset_hz)?;
         let result = self
             .usrp
             .set_tx_frequency(&request, self.channel)
@@ -378,6 +391,11 @@ impl Radio for UhdRadio {
                 let context = format!("UHD: set TX freq: {}", e);
                 Error::from(e).context(context)
             })?;
+        self.tx_correction.update_tune(
+            center_frequency as f64,
+            result.actual_rf_freq(),
+            result.actual_dsp_freq(),
+        )?;
         debug!(
             "UHD: TX tune target_rf={} actual_rf={} dsp={}",
             result.target_rf_freq(),
@@ -432,6 +450,11 @@ impl Radio for UhdRadio {
     }
 
     fn set_tx_lo_offset_hz(&mut self, offset_hz: i64) -> Result<(), Error> {
+        if self.tx_correction.is_software() && offset_hz != 0 {
+            return Err(Error::invalid_setting(
+                "software UHD TX frequency correction requires zero TX LO offset",
+            ));
+        }
         self.tx_lo_offset_hz = offset_hz as f64;
         Ok(())
     }
@@ -564,6 +587,7 @@ impl Radio for UhdRadio {
             health: TxRadioHealth::default(),
             channel: this.channel,
             tx_lo_offset_hz: this.tx_lo_offset_hz,
+            tx_correction: this.tx_correction,
         };
         let rx_channel = this.rx_channel;
         let rx = this.rx_streamer.map(|s| -> Box<dyn RadioRx> {
@@ -588,6 +612,7 @@ struct UhdTxHalf {
     health: TxRadioHealth,
     channel: usize,
     tx_lo_offset_hz: f64,
+    tx_correction: TxFrequencyCorrection,
 }
 
 struct UhdClockReader {
@@ -635,9 +660,15 @@ impl RadioTx for UhdTxHalf {
                 TransmitMetadata::with_flags(self.start_of_burst, metadata.end_of_burst)?
             }
         };
+        let corrected = self.tx_correction.samples(
+            samples,
+            metadata.schedule,
+            self.tx_rate_hz,
+            self.master_clock_rate,
+        )?;
         let count = self
             .tx_streamer
-            .send_with_metadata(&mut [samples], &native, 1.0)?;
+            .send_with_metadata(&mut [corrected], &native, 1.0)?;
         if count > samples.len() {
             return Err(Error::incomplete_write(count, samples.len()));
         }
@@ -686,7 +717,8 @@ impl RadioTx for UhdTxHalf {
         self.transmit_at(samples, None)
     }
 
-    fn prepare_transmit(&mut self, _max_samples: usize) -> Result<(), Error> {
+    fn prepare_transmit(&mut self, max_samples: usize) -> Result<(), Error> {
+        self.tx_correction.prepare(max_samples);
         if let Some(event) = self.tx_streamer.recv_async_msg(0.0).map_err(|e| {
             let context = format!("UHD: prepare TX async metadata: {e}");
             Error::from(e).context(context)
@@ -697,6 +729,17 @@ impl RadioTx for UhdTxHalf {
     }
 
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
+        if self.tx_correction.is_software() {
+            return self.write_all(
+                samples,
+                crate::TxMetadata {
+                    schedule: tick.map_or(crate::Schedule::Immediate, |ticks| {
+                        crate::Schedule::At(crate::DeviceTime::from_ticks(ticks))
+                    }),
+                    end_of_burst: false,
+                },
+            );
+        }
         self.send_samples(samples, tick)
     }
 
@@ -734,17 +777,21 @@ impl RadioTx for UhdTxHalf {
 
     fn set_tx_frequency_hz(&mut self, frequency_hz: f64) -> Result<(), Error> {
         crate::stream::positive_hz(frequency_hz, "frequency")?;
-        let request = if self.tx_lo_offset_hz != 0.0 {
-            TuneRequest::with_frequency_lo(frequency_hz, self.tx_lo_offset_hz)
-        } else {
-            TuneRequest::with_frequency(frequency_hz)
-        };
-        self.usrp
+        let request = self
+            .tx_correction
+            .tune_request(frequency_hz, self.tx_lo_offset_hz)?;
+        let result = self
+            .usrp
             .configure(|usrp| usrp.set_tx_frequency(&request, self.channel))
             .map_err(|e| {
                 let context = format!("UHD: set TX freq: {}", e);
                 Error::from(e).context(context)
             })?;
+        self.tx_correction.update_tune(
+            frequency_hz,
+            result.actual_rf_freq(),
+            result.actual_dsp_freq(),
+        )?;
         Ok(())
     }
 

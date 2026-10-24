@@ -86,6 +86,8 @@ When a radio is opened from a configuration file, `tx_rate_policy` and `rx_rate_
 
 Frequencies, rates and bandwidths must be set by the application. The exception is the USRP master clock. When `master_clock_rate` is omitted, the largest supported clock that every configured rate divides evenly is selected, so each sample spans a whole number of ticks. When it is set, it is used as given, and a rate that does not divide it evenly is an error at open time.
 
+For UHD, software TX frequency correction is enabled by default to work around a UHD bug that causes unwanted phase jumps when late samples interrupt TX playback. Set `software_tx_frequency_correction: false` to disable it.
+
 ## Timed transmit and bursts
 
 Not every backend can schedule samples. Support is reported per capability:
