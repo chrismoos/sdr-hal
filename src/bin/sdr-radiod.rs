@@ -89,8 +89,10 @@ async fn run(args: Args, config: RadiodConfig) -> Result<(), sdr_hal::error::Err
         antenna: radio_config.device.rx_antenna_or_default(),
         gain_db: radio_config.device.rx_gain_db_f64(),
     };
+    let reopen_config = radio_config.clone();
     serve(
         radio,
+        Box::new(move || reopen_config.open()),
         radio_config.device.has_rx(),
         radio_config.device.kind_name().to_string(),
         rx_defaults,

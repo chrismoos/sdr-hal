@@ -1,4 +1,5 @@
 # HEAD
+- A new radiod client can set different rates and bandwidths after the previous client disconnects.
 - Fixed a crash when a UHD radio on the SoapyUHD bridge is dropped (the device was released before its streamers).
 - Improved bladeRF and Soapy compatibility with composite radiod and reduced streaming delays.
 - Added composite TX arrival and RX sample-age diagnostics.

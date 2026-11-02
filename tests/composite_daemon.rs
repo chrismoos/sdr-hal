@@ -278,6 +278,11 @@ fn start_server_with_config(
             let localhost = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
             let serve_fut = serve(
                 radio,
+                Box::new(|| {
+                    Err(sdr_hal::error::Error::from(
+                        "the composite test device opens once",
+                    ))
+                }),
                 true,
                 "composite-fake".to_string(),
                 RxDefaults::default(),

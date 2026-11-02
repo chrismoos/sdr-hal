@@ -3,6 +3,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use crate::Radio;
 use crate::network::proto::radio_control_service_server::{
@@ -13,7 +14,7 @@ use crate::network::{proto, wire};
 use crate::error::Error;
 use log::{info, warn};
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 use super::bridge::{RxBridge, RxCommand, TxBridge, TxCommand};
@@ -49,7 +50,14 @@ struct IdleState {
     recorded: RecordedSettings,
 }
 
+/// Reopens the device after a client disconnects.
+pub type RadioOpener = Box<dyn FnMut() -> Result<Box<dyn Radio>, Error> + Send>;
+
+const REOPEN_ATTEMPTS: usize = 15;
+const REOPEN_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 struct RunningState {
+    owner: Option<SocketAddr>,
     tx_thread: std::thread::JoinHandle<()>,
     rx_thread: Option<std::thread::JoinHandle<()>>,
     tx_cmds: crossbeam_channel::Sender<TxCommand>,
@@ -61,11 +69,14 @@ struct RunningState {
 enum State {
     Idle(IdleState),
     Running(RunningState),
+    Resetting,
     Unavailable,
 }
 
 struct Shared {
     state: Mutex<State>,
+    reopen: Mutex<RadioOpener>,
+    settled: tokio::sync::Notify,
     sessions: Arc<Sessions>,
     /// Composite client settings, present only when the operator configured a shared
     /// device stream.
@@ -116,14 +127,29 @@ fn new_session_id() -> u32 {
 }
 
 impl Shared {
-    fn apply_setting<T: PartialEq + Copy + std::fmt::Debug>(
+    async fn settled_state(&self) -> parking_lot::MutexGuard<'_, State> {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.state.lock();
+                if !matches!(*state, State::Resetting) {
+                    return state;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    async fn apply_setting<T: PartialEq + Copy + std::fmt::Debug>(
         &self,
         name: &str,
         value: T,
         field: impl Fn(&mut RecordedSettings) -> &mut Option<T>,
         apply: impl FnOnce(&mut dyn Radio) -> Result<(), Error>,
     ) -> Result<(), Status> {
-        let mut state = self.state.lock();
+        let mut state = self.settled_state().await;
         match &mut *state {
             State::Idle(idle) => {
                 apply(idle.radio.as_mut()).map_err(internal)?;
@@ -139,12 +165,12 @@ impl Shared {
                     )))
                 }
             }
-            State::Unavailable => Err(Status::unavailable("radio unavailable")),
+            State::Resetting | State::Unavailable => Err(Status::unavailable("radio unavailable")),
         }
     }
 
-    fn tx_command(&self, cmd: TxCommand) -> Result<(), Status> {
-        let state = self.state.lock();
+    async fn tx_command(&self, cmd: TxCommand) -> Result<(), Status> {
+        let state = self.settled_state().await;
         match &*state {
             State::Running(running) => running
                 .tx_cmds
@@ -154,8 +180,8 @@ impl Shared {
         }
     }
 
-    fn rx_command(&self, cmd: RxCommand) -> Result<(), Status> {
-        let state = self.state.lock();
+    async fn rx_command(&self, cmd: RxCommand) -> Result<(), Status> {
+        let state = self.settled_state().await;
         match &*state {
             State::Running(running) => match &running.rx_cmds {
                 Some(rx_cmds) => rx_cmds
@@ -221,11 +247,11 @@ impl RadioControlSvc {
         self.shared.composite.as_deref()
     }
 
-    fn device_tick_rate(&self) -> Result<u64, Status> {
-        match &*self.shared.state.lock() {
+    async fn device_tick_rate(&self) -> Result<u64, Status> {
+        match &*self.shared.settled_state().await {
             State::Idle(idle) => Ok(idle.radio.tick_rate()),
             State::Running(running) => Ok(running.recorded.tick_rate),
-            State::Unavailable => Err(Status::unavailable("radio unavailable")),
+            State::Resetting | State::Unavailable => Err(Status::unavailable("radio unavailable")),
         }
     }
 
@@ -253,7 +279,7 @@ impl RadioControlSvc {
         let shared = &self.shared;
 
         let (tx_cmds, rx_cmds) = {
-            let mut state = shared.state.lock();
+            let mut state = shared.settled_state().await;
             if matches!(&*state, State::Idle(_)) {
                 self.composite_start(&mut state, samples_per_packet)?;
             }
@@ -262,7 +288,9 @@ impl RadioControlSvc {
                 State::Idle(_) => {
                     return Err(Status::internal("composite start left the radio idle"));
                 }
-                State::Unavailable => return Err(Status::unavailable("radio unavailable")),
+                State::Resetting | State::Unavailable => {
+                    return Err(Status::unavailable("radio unavailable"));
+                }
             }
         };
 
@@ -454,6 +482,7 @@ impl RadioControlSvc {
             config.tx_digital_backoff_db
         );
         *state = State::Running(RunningState {
+            owner: None,
             tx_thread,
             rx_thread,
             tx_cmds,
@@ -476,21 +505,24 @@ impl RadioControlService for RadioControlSvc {
     async fn get_info(&self, _request: Request<()>) -> Result<Response<proto::RadioInfo>, Status> {
         if let Some(registry) = self.shared.composite.as_ref() {
             let key = client_key(&_request)?;
-            let guard = registry.lock();
-            let client = guard.get(key);
             // Each client sees its own rates. The clock is shared and real, so every
             // client reads the same tick rate and the same device time.
-            let tx_rate = client.and_then(|c| c.tx.sample_rate_hz);
-            let rx_rate = client
-                .filter(|c| c.rx_configured)
-                .and_then(|c| c.rx.sample_rate_hz);
-            let config = *guard.config();
-            drop(guard);
+            let (tx_rate, rx_rate, config) = {
+                let guard = registry.lock();
+                let client = guard.get(key);
+                (
+                    client.and_then(|c| c.tx.sample_rate_hz),
+                    client
+                        .filter(|c| c.rx_configured)
+                        .and_then(|c| c.rx.sample_rate_hz),
+                    *guard.config(),
+                )
+            };
             let range = |(minimum, maximum): (u64, u64)| proto::ValueRange {
                 minimum: minimum as f64,
                 maximum: maximum as f64,
             };
-            let tick_rate = self.device_tick_rate()?;
+            let tick_rate = self.device_tick_rate().await?;
             let capabilities = crate::network::encode_capabilities(
                 self.shared.tx_capabilities,
                 self.shared.rx_supported,
@@ -521,7 +553,7 @@ impl RadioControlService for RadioControlSvc {
                 tx_gain_db: None,
             }));
         }
-        let (tx_rate, rx_rate, tick_rate) = match &*self.shared.state.lock() {
+        let (tx_rate, rx_rate, tick_rate) = match &*self.shared.settled_state().await {
             State::Idle(idle) => (
                 // Report what a client negotiated, not whatever rate the driver came up
                 // at, so an unconfigured stream reads as absent.
@@ -534,7 +566,9 @@ impl RadioControlService for RadioControlSvc {
                 running.recorded.actual_rx_sample_rate_hz,
                 running.recorded.tick_rate,
             ),
-            State::Unavailable => return Err(Status::unavailable("radio unavailable")),
+            State::Resetting | State::Unavailable => {
+                return Err(Status::unavailable("radio unavailable"));
+            }
         };
         Ok(Response::new(proto::RadioInfo {
             actual_tx_sample_rate_hz: tx_rate,
@@ -586,34 +620,40 @@ impl RadioControlService for RadioControlSvc {
             };
             if let Some((slot, plan, gain)) = plan {
                 let (reply, reply_rx) = oneshot::channel();
-                self.shared.tx_command(TxCommand::RetuneSlot {
-                    slot,
-                    plan,
-                    gain,
-                    reply,
-                })?;
+                self.shared
+                    .tx_command(TxCommand::RetuneSlot {
+                        slot,
+                        plan,
+                        gain,
+                        reply,
+                    })
+                    .await?;
                 await_reply(reply_rx).await?;
             }
             return Ok(Response::new(()));
         }
         let frequency = usize::try_from(frequency_hz)
             .map_err(|_| Status::invalid_argument("frequency exceeds platform usize"))?;
-        let running = matches!(&*self.shared.state.lock(), State::Running(_));
+        let running = matches!(&*self.shared.settled_state().await, State::Running(_));
         if running {
             let (reply, reply_rx) = oneshot::channel();
-            self.shared.tx_command(TxCommand::SetFrequencyHz {
-                frequency_hz: frequency_hz as f64,
-                reply,
-            })?;
+            self.shared
+                .tx_command(TxCommand::SetFrequencyHz {
+                    frequency_hz: frequency_hz as f64,
+                    reply,
+                })
+                .await?;
             await_reply(reply_rx).await?;
             return Ok(Response::new(()));
         }
-        self.shared.apply_setting(
-            "TX frequency",
-            frequency_hz,
-            |r| &mut r.tx_frequency_hz,
-            |radio| radio.set_tx_frequency(frequency),
-        )?;
+        self.shared
+            .apply_setting(
+                "TX frequency",
+                frequency_hz,
+                |r| &mut r.tx_frequency_hz,
+                |radio| radio.set_tx_frequency(frequency),
+            )
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -634,7 +674,7 @@ impl RadioControlService for RadioControlSvc {
                 actual_sample_rate_hz: applied,
             }));
         }
-        let mut state = self.shared.state.lock();
+        let mut state = self.shared.settled_state().await;
         let actual_sample_rate_hz = match &mut *state {
             State::Idle(idle) => {
                 idle.radio
@@ -666,7 +706,9 @@ impl RadioControlService for RadioControlSvc {
                     "cannot change TX sample rate while a session is active",
                 ));
             }
-            State::Unavailable => return Err(Status::unavailable("radio unavailable")),
+            State::Resetting | State::Unavailable => {
+                return Err(Status::unavailable("radio unavailable"));
+            }
         };
         Ok(Response::new(proto::SetTxSampleRateResponse {
             actual_sample_rate_hz,
@@ -691,12 +733,14 @@ impl RadioControlService for RadioControlSvc {
         }
         let bandwidth = usize::try_from(bandwidth_hz)
             .map_err(|_| Status::invalid_argument("bandwidth exceeds platform usize"))?;
-        self.shared.apply_setting(
-            "TX bandwidth",
-            bandwidth_hz,
-            |r| &mut r.tx_bandwidth_hz,
-            |radio| radio.set_tx_bandwidth(bandwidth),
-        )?;
+        self.shared
+            .apply_setting(
+                "TX bandwidth",
+                bandwidth_hz,
+                |r| &mut r.tx_bandwidth_hz,
+                |radio| radio.set_tx_bandwidth(bandwidth),
+            )
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -706,7 +750,7 @@ impl RadioControlService for RadioControlSvc {
     ) -> Result<Response<proto::SetTickRateResponse>, Status> {
         let requested = request.into_inner().tick_rate;
         if self.composite().is_some() {
-            let actual_tick_rate = self.device_tick_rate()?;
+            let actual_tick_rate = self.device_tick_rate().await?;
             if requested != actual_tick_rate {
                 ignored_device_setting("the device clock", format!("{requested} Hz"));
             }
@@ -714,7 +758,7 @@ impl RadioControlService for RadioControlSvc {
                 actual_tick_rate,
             }));
         }
-        let mut state = self.shared.state.lock();
+        let mut state = self.shared.settled_state().await;
         let actual_tick_rate = match &mut *state {
             State::Idle(idle) => {
                 let actual = idle.radio.set_tick_rate(requested).map_err(internal)?;
@@ -734,7 +778,9 @@ impl RadioControlService for RadioControlSvc {
                 }
                 requested
             }
-            State::Unavailable => return Err(Status::unavailable("radio unavailable")),
+            State::Resetting | State::Unavailable => {
+                return Err(Status::unavailable("radio unavailable"));
+            }
         };
         Ok(Response::new(proto::SetTickRateResponse {
             actual_tick_rate,
@@ -753,12 +799,14 @@ impl RadioControlService for RadioControlSvc {
             return Ok(Response::new(()));
         }
         let offset_hz = request.into_inner().offset_hz;
-        self.shared.apply_setting(
-            "TX LO offset",
-            offset_hz,
-            |r| &mut r.tx_lo_offset_hz,
-            |radio| radio.set_tx_lo_offset_hz(offset_hz),
-        )?;
+        self.shared
+            .apply_setting(
+                "TX LO offset",
+                offset_hz,
+                |r| &mut r.tx_lo_offset_hz,
+                |radio| radio.set_tx_lo_offset_hz(offset_hz),
+            )
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -795,7 +843,7 @@ impl RadioControlService for RadioControlSvc {
         }
 
         let gain_db = {
-            let mut state = self.shared.state.lock();
+            let mut state = self.shared.settled_state().await;
             match &mut *state {
                 State::Idle(idle) => {
                     let actual_sample_rate_hz = idle
@@ -854,21 +902,24 @@ impl RadioControlService for RadioControlSvc {
                         ));
                     }
                 },
-                State::Unavailable => return Err(Status::unavailable("radio unavailable")),
+                State::Resetting | State::Unavailable => {
+                    return Err(Status::unavailable("radio unavailable"));
+                }
             }
         };
 
         if let Some(gain_db) = gain_db {
             let (reply, reply_rx) = oneshot::channel();
             self.shared
-                .rx_command(RxCommand::SetGain { gain_db, reply })?;
+                .rx_command(RxCommand::SetGain { gain_db, reply })
+                .await?;
             let reference = await_reply(reply_rx).await?;
             self.shared
                 .rx_reference_bits
                 .store(reference.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
         }
         info!("radiod: rx prepared for a new client gain={gain_db:?}");
-        if let State::Running(running) = &mut *self.shared.state.lock() {
+        if let State::Running(running) = &mut *self.shared.settled_state().await {
             running.recorded.rx = Some(req);
         }
         Ok(Response::new(proto::SetupRxResponse {
@@ -896,7 +947,7 @@ impl RadioControlService for RadioControlSvc {
                 .await
                 .map(Response::new);
         }
-        let mut state = shared.state.lock();
+        let mut state = shared.settled_state().await;
         match std::mem::replace(&mut *state, State::Unavailable) {
             State::Idle(idle) => {
                 let tx_sample_rate_hz = idle.recorded.actual_tx_sample_rate_hz;
@@ -999,6 +1050,7 @@ impl RadioControlService for RadioControlSvc {
                     "radiod: session {session_id:#010x} open, samples_per_packet={samples_per_packet}"
                 );
                 *state = State::Running(RunningState {
+                    owner: composite_key,
                     tx_thread,
                     rx_thread,
                     tx_cmds,
@@ -1012,10 +1064,7 @@ impl RadioControlService for RadioControlSvc {
                     samples_per_packet: samples_per_packet as u32,
                 }))
             }
-            running @ State::Running(_) => {
-                let State::Running(ref session) = running else {
-                    unreachable!()
-                };
+            State::Running(mut session) => {
                 let session_id = new_session_id();
                 let samples_per_packet = session.samples_per_packet;
                 shared.sessions.replace_with_one(Session {
@@ -1027,14 +1076,15 @@ impl RadioControlService for RadioControlSvc {
                 warn!(
                     "radiod: superseding active session with {session_id:#010x} (client reconnect)"
                 );
-                *state = running;
+                session.owner = composite_key;
+                *state = State::Running(session);
                 Ok(Response::new(proto::OpenSessionResponse {
                     session_id,
                     data_port: shared.data_port as u32,
                     samples_per_packet: samples_per_packet as u32,
                 }))
             }
-            State::Unavailable => Err(Status::unavailable("radio unavailable")),
+            State::Resetting | State::Unavailable => Err(Status::unavailable("radio unavailable")),
         }
     }
 
@@ -1043,12 +1093,14 @@ impl RadioControlService for RadioControlSvc {
         _request: Request<()>,
     ) -> Result<Response<proto::HardwareTime>, Status> {
         // Before a session the radio is still whole, so it answers directly.
-        if let State::Idle(idle) = &*self.shared.state.lock() {
+        if let State::Idle(idle) = &*self.shared.settled_state().await {
             let time_ticks = idle.radio.hardware_time().map_err(internal)?;
             return Ok(Response::new(proto::HardwareTime { time_ticks }));
         }
         let (reply, reply_rx) = oneshot::channel();
-        self.shared.tx_command(TxCommand::GetHardwareTime(reply))?;
+        self.shared
+            .tx_command(TxCommand::GetHardwareTime(reply))
+            .await?;
         let time_ticks = await_reply(reply_rx).await?;
         Ok(Response::new(proto::HardwareTime { time_ticks }))
     }
@@ -1067,7 +1119,8 @@ impl RadioControlService for RadioControlSvc {
         }
         let (reply, reply_rx) = oneshot::channel();
         self.shared
-            .tx_command(TxCommand::SetHardwareTime { time_ticks, reply })?;
+            .tx_command(TxCommand::SetHardwareTime { time_ticks, reply })
+            .await?;
         await_reply(reply_rx).await?;
         Ok(Response::new(()))
     }
@@ -1084,7 +1137,7 @@ impl RadioControlService for RadioControlSvc {
         let has_tx = if self.composite().is_some() {
             slot.is_some()
         } else {
-            match &*self.shared.state.lock() {
+            match &*self.shared.settled_state().await {
                 State::Running(running) => running.recorded.actual_tx_sample_rate_hz.is_some(),
                 _ => true,
             }
@@ -1097,12 +1150,14 @@ impl RadioControlService for RadioControlSvc {
                 "this session has no TX stream, so it cannot transmit",
             ));
         }
-        self.shared.tx_command(TxCommand::EnableTransmit {
-            enable: req.enable,
-            time_ticks: req.time_ticks,
-            slot,
-            reply,
-        })?;
+        self.shared
+            .tx_command(TxCommand::EnableTransmit {
+                enable: req.enable,
+                time_ticks: req.time_ticks,
+                slot,
+                reply,
+            })
+            .await?;
         await_reply(reply_rx).await?;
         Ok(Response::new(()))
     }
@@ -1137,12 +1192,14 @@ impl RadioControlService for RadioControlSvc {
                 (None, Some(plan)) => {
                     let device_rate_hz = registry.lock().config().device_rate_hz;
                     let (reply, reply_rx) = oneshot::channel();
-                    self.shared.rx_command(RxCommand::AddSlot {
-                        plan: plan.clone(),
-                        sample_rate_hz: device_rate_hz as f64 * plan.denominator as f64
-                            / plan.ratio as f64,
-                        reply,
-                    })?;
+                    self.shared
+                        .rx_command(RxCommand::AddSlot {
+                            plan: plan.clone(),
+                            sample_rate_hz: device_rate_hz as f64 * plan.denominator as f64
+                                / plan.ratio as f64,
+                            reply,
+                        })
+                        .await?;
                     let slot = await_reply(reply_rx).await?;
                     registry.lock().set_rx_slot(key, Some(slot));
                     Some(slot)
@@ -1165,7 +1222,8 @@ impl RadioControlService for RadioControlSvc {
         }
         let (reply, reply_rx) = oneshot::channel();
         self.shared
-            .rx_command(RxCommand::Activate { time_ticks, reply })?;
+            .rx_command(RxCommand::Activate { time_ticks, reply })
+            .await?;
         await_reply(reply_rx).await?;
         Ok(Response::new(()))
     }
@@ -1196,7 +1254,8 @@ impl RadioControlService for RadioControlSvc {
             if let Some(slot) = slot {
                 let (reply, reply_rx) = oneshot::channel();
                 self.shared
-                    .rx_command(RxCommand::RetireSlot { slot, reply })?;
+                    .rx_command(RxCommand::RetireSlot { slot, reply })
+                    .await?;
                 await_reply(reply_rx).await?;
             }
             if remaining > 0 {
@@ -1207,7 +1266,7 @@ impl RadioControlService for RadioControlSvc {
             }
         }
         let (reply, reply_rx) = oneshot::channel();
-        self.shared.rx_command(RxCommand::Stop { reply })?;
+        self.shared.rx_command(RxCommand::Stop { reply }).await?;
         await_reply(reply_rx).await?;
         Ok(Response::new(()))
     }
@@ -1235,16 +1294,19 @@ impl RadioControlService for RadioControlSvc {
             if let Some((slot, plan)) = plan {
                 let (reply, reply_rx) = oneshot::channel();
                 self.shared
-                    .rx_command(RxCommand::RetuneSlot { slot, plan, reply })?;
+                    .rx_command(RxCommand::RetuneSlot { slot, plan, reply })
+                    .await?;
                 await_reply(reply_rx).await?;
             }
             return Ok(Response::new(()));
         }
         let (reply, reply_rx) = oneshot::channel();
-        self.shared.rx_command(RxCommand::SetFrequency {
-            frequency_hz,
-            reply,
-        })?;
+        self.shared
+            .rx_command(RxCommand::SetFrequency {
+                frequency_hz,
+                reply,
+            })
+            .await?;
         await_reply(reply_rx).await?;
         Ok(Response::new(()))
     }
@@ -1267,14 +1329,16 @@ impl RadioControlService for RadioControlSvc {
             }));
         }
         let running = {
-            let mut state = self.shared.state.lock();
+            let mut state = self.shared.settled_state().await;
             match &mut *state {
                 State::Idle(idle) => {
                     let applied = idle.radio.set_tx_gain(gain_db).map_err(internal)?;
                     Some((applied, idle.radio.tx_full_scale_power_estimate_dbm()))
                 }
                 State::Running(_) => None,
-                State::Unavailable => return Err(Status::unavailable("radio unavailable")),
+                State::Resetting | State::Unavailable => {
+                    return Err(Status::unavailable("radio unavailable"));
+                }
             }
         };
         let (applied, estimate) = match running {
@@ -1282,7 +1346,8 @@ impl RadioControlService for RadioControlSvc {
             None => {
                 let (reply, reply_rx) = oneshot::channel();
                 self.shared
-                    .tx_command(TxCommand::SetGain { gain_db, reply })?;
+                    .tx_command(TxCommand::SetGain { gain_db, reply })
+                    .await?;
                 await_reply(reply_rx).await?
             }
         };
@@ -1309,7 +1374,8 @@ impl RadioControlService for RadioControlSvc {
         }
         let (reply, reply_rx) = oneshot::channel();
         self.shared
-            .rx_command(RxCommand::SetGain { gain_db, reply })?;
+            .rx_command(RxCommand::SetGain { gain_db, reply })
+            .await?;
         let reference = await_reply(reply_rx).await?;
         self.shared
             .rx_reference_bits
@@ -1321,6 +1387,9 @@ impl RadioControlService for RadioControlSvc {
 /// Runs a radio server, taking ownership of `radio`. Control requests use gRPC on
 /// `listen`. IQ uses UDP and TCP on `data_listen`.
 ///
+/// When `reopen` keeps failing after a client leaves, the server reports the radio
+/// unavailable until radiod is restarted.
+///
 /// Set `rx_supported` to the receive capability clients should see. `backend` is
 /// the driver name returned in control responses. Calibration comes from the radio.
 ///
@@ -1331,6 +1400,7 @@ impl RadioControlService for RadioControlSvc {
 /// control-server, and stream-stop errors are returned.
 pub async fn serve(
     radio: Box<dyn Radio>,
+    reopen: RadioOpener,
     rx_supported: bool,
     backend: String,
     rx_defaults: RxDefaults,
@@ -1365,6 +1435,8 @@ pub async fn serve(
             radio,
             recorded: RecordedSettings::default(),
         })),
+        reopen: Mutex::new(reopen),
+        settled: tokio::sync::Notify::new(),
         sessions: Sessions::new(),
         composite: composite.map(|config| Arc::new(Mutex::new(ClientRegistry::new(config)))),
         data_socket,
@@ -1397,16 +1469,18 @@ pub async fn serve(
         let _ = ready.send((control_addr, data_addr));
     }
 
-    // A composite client is identified by its control connection, so that connection
-    // closing is what reports the client leaving, whatever its data transport does.
-    let watch = shared
-        .composite
-        .as_ref()
-        .map(|registry| ClientWatch::new(shared.sessions.clone(), registry.clone()));
+    let (left_tx, mut left_rx) = mpsc::unbounded_channel();
+    let watch = ClientWatch::new(shared.sessions.clone(), shared.composite.clone(), left_tx);
     let incoming = tokio_stream::StreamExt::map(
         tokio_stream::wrappers::TcpListenerStream::new(listener),
         move |accepted| accepted.map(|stream| WatchedStream::new(stream, watch.clone())),
     );
+    let reset_shared = shared.clone();
+    let resets = tokio::spawn(async move {
+        while let Some(peer) = left_rx.recv().await {
+            reset_after_client_left(&reset_shared, peer).await;
+        }
+    });
     let control_result = tonic::transport::Server::builder()
         .add_service(RadioControlServiceServer::new(RadioControlSvc {
             shared: shared.clone(),
@@ -1414,6 +1488,7 @@ pub async fn serve(
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
     let stopped = shutdown_streams(&shared).await;
+    resets.abort();
     stopped?;
     control_result.map_err(|e| {
         let context = format!("radiod: control plane failed: {e}");
@@ -1449,10 +1524,92 @@ fn set_receive_buffer(socket: &UdpSocket, bytes: usize) {
 async fn shutdown_streams(shared: &Shared) -> Result<(), Error> {
     // No client may keep sending into a stopped stream.
     shared.sessions.clear();
-    let state = std::mem::replace(&mut *shared.state.lock(), State::Unavailable);
+    let state = std::mem::replace(&mut *shared.settled_state().await, State::Unavailable);
     let State::Running(running) = state else {
         return Ok(());
     };
+    stop_streams(running).await
+}
+
+async fn reset_after_client_left(shared: &Arc<Shared>, peer: SocketAddr) {
+    let running = {
+        let mut state = shared.state.lock();
+        let owned = matches!(&*state, State::Running(running) if running.owner == Some(peer));
+        if !owned {
+            return;
+        }
+        let State::Running(running) = std::mem::replace(&mut *state, State::Resetting) else {
+            unreachable!("checked above");
+        };
+        running
+    };
+    // No packet from the departed client may reach the workers while they stop.
+    shared.sessions.clear();
+    info!("radiod: client {peer} closed its control connection, stopping TX and RX");
+    if let Err(error) = stop_streams(running).await {
+        warn!("radiod: stopping the streams after client {peer} left failed: {error}");
+    }
+    let reopened = reopen_device(shared).await;
+    let mut state = shared.state.lock();
+    match reopened {
+        Ok(radio) => {
+            shared.rx_reference_bits.store(
+                radio.rx_reference_dbm().unwrap_or(f32::NAN).to_bits(),
+                Ordering::Relaxed,
+            );
+            shared.tx_estimate_bits.store(
+                radio
+                    .tx_full_scale_power_estimate_dbm()
+                    .unwrap_or(f32::NAN)
+                    .to_bits(),
+                Ordering::Relaxed,
+            );
+            let tx_gain_db = shared.tx_gain_range_db.and_then(|_| radio.tx_gain_db());
+            shared
+                .tx_gain_bits
+                .store(tx_gain_db.unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
+            shared.rx_sample_rate_hz.store(0, Ordering::Relaxed);
+            *state = State::Idle(IdleState {
+                radio,
+                recorded: RecordedSettings::default(),
+            });
+            info!("radiod: device reopened with no stream configured, waiting for a client");
+        }
+        Err(error) => {
+            *state = State::Unavailable;
+            log::error!(
+                "radiod: could not reopen the device after client {peer} left: {error}. Restart radiod to serve again"
+            );
+        }
+    }
+    drop(state);
+    shared.settled.notify_waiters();
+}
+
+async fn reopen_device(shared: &Arc<Shared>) -> Result<Box<dyn Radio>, Error> {
+    for attempt in 1..=REOPEN_ATTEMPTS {
+        let shared = shared.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut reopen = shared.reopen.lock();
+            reopen()
+        })
+        .await
+        .map_err(|_| Error::from("radiod: device reopen panicked"))?;
+        match result {
+            Ok(radio) => return Ok(radio),
+            Err(error) if attempt < REOPEN_ATTEMPTS => {
+                warn!(
+                    "radiod: device reopen attempt {attempt} of {REOPEN_ATTEMPTS} failed: {error}"
+                );
+                tokio::time::sleep(REOPEN_RETRY_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
+async fn stop_streams(running: RunningState) -> Result<(), Error> {
     let (tx_reply, tx_done) = oneshot::channel();
     let tx_sent = running
         .tx_cmds

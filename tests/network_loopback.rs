@@ -344,18 +344,19 @@ fn start_server_with_calibration(
     state: Arc<Mutex<FakeState>>,
     calibration: RadioCalibration,
 ) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    let radio = Box::new(FakeRadio {
-        state,
-        clock: Arc::new(FakeClock {
-            start: Instant::now(),
-        }),
+    let clock = Arc::new(FakeClock {
+        start: Instant::now(),
     });
-    let radio = Box::new(
-        CalibratedRadio::new(radio, calibration)
-            .unwrap()
-            .with_rx_reference_gain_db(Some(30.0))
-            .unwrap(),
-    );
+    let open = move || -> Result<Box<dyn Radio>, Error> {
+        let radio = Box::new(FakeRadio {
+            state: state.clone(),
+            clock: clock.clone(),
+        });
+        Ok(Box::new(
+            CalibratedRadio::new(radio, calibration)?.with_rx_reference_gain_db(Some(30.0))?,
+        ))
+    };
+    let radio = open().expect("fake radio");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -368,6 +369,7 @@ fn start_server_with_calibration(
             let localhost = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
             let serve_fut = serve(
                 radio,
+                Box::new(open),
                 true,
                 "fake".to_string(),
                 RxDefaults {
@@ -415,6 +417,46 @@ fn client_connects_from_multithreaded_tokio_runtime() {
             .set_tx_frequency(881_520_000)
             .expect("control RPC from async runtime");
     });
+}
+
+#[test]
+fn a_client_that_leaves_frees_the_device_for_the_next_client_to_reconfigure() {
+    const SECOND_RX_RATE_HZ: f64 = 2.0 * RX_RATE_HZ;
+    const SECOND_RX_BANDWIDTH_HZ: f64 = 3_000_000.0;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (_server, control_addr) = start_server(state.clone());
+    {
+        let mut first =
+            NetworkRadio::connect(&control_addr.to_string(), NetworkRadioOptions::default())
+                .unwrap();
+        first.set_tx_sample_rate(TX_RATE_HZ as f64).unwrap();
+        first
+            .setup_rx(0, "", RX_RATE_HZ, 2_500_000.0, None)
+            .unwrap();
+        let (mut tx, _rx) = Box::new(first).split().unwrap();
+        tx.enable_transmit(true).unwrap();
+        assert_eq!(state.lock().transmit_enabled.map(|(on, _)| on), Some(true));
+    }
+
+    let mut second =
+        NetworkRadio::connect(&control_addr.to_string(), NetworkRadioOptions::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match second.setup_rx(0, "", SECOND_RX_RATE_HZ, SECOND_RX_BANDWIDTH_HZ, None) {
+            Ok(_) => break,
+            Err(error) if Instant::now() < deadline => {
+                assert!(error.to_string().contains("session"), "{error}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("second client could not change the RX setup: {error}"),
+        }
+    }
+    let state = state.lock();
+    assert_eq!(state.transmit_enabled.map(|(on, _)| on), Some(false));
+    assert_eq!(
+        state.rx_setup.as_ref().map(|setup| (setup.2, setup.3)),
+        Some((SECOND_RX_RATE_HZ, SECOND_RX_BANDWIDTH_HZ))
+    );
 }
 
 #[test]
@@ -1134,9 +1176,13 @@ fn daemon_shutdown_stops_tx_and_deactivates_rx_before_returning() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (ready, ready_receiver) = tokio::sync::oneshot::channel();
-            let radio = Box::new(FakeRadio { state: server_state, clock: Arc::new(FakeClock { start: Instant::now() }) });
+            let clock = Arc::new(FakeClock { start: Instant::now() });
+            let open = move || -> Result<Box<dyn Radio>, Error> {
+                Ok(Box::new(FakeRadio { state: server_state.clone(), clock: clock.clone() }))
+            };
+            let radio = open().unwrap();
             let localhost = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
-            let service = serve(radio, true, "fake".into(), RxDefaults::default(), None, localhost, localhost, Some(ready), async { let _ = shutdown_rx.await; });
+            let service = serve(radio, Box::new(open), true, "fake".into(), RxDefaults::default(), None, localhost, localhost, Some(ready), async { let _ = shutdown_rx.await; });
             tokio::pin!(service);
             tokio::select! {
                 result = &mut service => panic!("server exited before ready: {result:?}"),

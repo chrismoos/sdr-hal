@@ -1,8 +1,8 @@
 //! Noticing when a control connection closes.
 //!
-//! A composite client is identified by its control connection, and that connection lives
-//! exactly as long as the client does. Watching it closing is what notices a client that
-//! only receives: its data plane can be silent UDP, which reports nothing, but no client
+//! A client is identified by its control connection, and that connection lives exactly
+//! as long as the client does. Watching it closing is what notices a client that only
+//! receives: its data plane can be silent UDP, which reports nothing, but no client
 //! outlives its control connection.
 
 use std::net::SocketAddr;
@@ -14,24 +14,37 @@ use log::info;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 
 use super::composite::ClientRegistry;
 use super::sessions::Sessions;
 
-/// Releases a composite client's session and slots when its control connection closes.
 pub(crate) struct ClientWatch {
     sessions: Arc<Sessions>,
-    registry: Arc<Mutex<ClientRegistry>>,
+    registry: Option<Arc<Mutex<ClientRegistry>>>,
+    left: mpsc::UnboundedSender<SocketAddr>,
 }
 
 impl ClientWatch {
-    pub(crate) fn new(sessions: Arc<Sessions>, registry: Arc<Mutex<ClientRegistry>>) -> Arc<Self> {
-        Arc::new(Self { sessions, registry })
+    pub(crate) fn new(
+        sessions: Arc<Sessions>,
+        registry: Option<Arc<Mutex<ClientRegistry>>>,
+        left: mpsc::UnboundedSender<SocketAddr>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            sessions,
+            registry,
+            left,
+        })
     }
 
     fn client_left(&self, peer: SocketAddr) {
-        let Some(session_id) = self.registry.lock().forget(peer) else {
+        let Some(registry) = &self.registry else {
+            let _ = self.left.send(peer);
+            return;
+        };
+        let Some(session_id) = registry.lock().forget(peer) else {
             return;
         };
         match session_id {
@@ -53,11 +66,11 @@ impl ClientWatch {
 pub(crate) struct WatchedStream {
     inner: TcpStream,
     peer: Option<SocketAddr>,
-    watch: Option<Arc<ClientWatch>>,
+    watch: Arc<ClientWatch>,
 }
 
 impl WatchedStream {
-    pub(crate) fn new(inner: TcpStream, watch: Option<Arc<ClientWatch>>) -> Self {
+    pub(crate) fn new(inner: TcpStream, watch: Arc<ClientWatch>) -> Self {
         let peer = inner.peer_addr().ok();
         Self { inner, peer, watch }
     }
@@ -65,12 +78,11 @@ impl WatchedStream {
 
 impl Drop for WatchedStream {
     fn drop(&mut self) {
-        if let Some((watch, peer)) = self.watch.as_ref().zip(self.peer) {
-            watch.client_left(peer);
+        if let Some(peer) = self.peer {
+            self.watch.client_left(peer);
         }
     }
 }
-
 impl Connected for WatchedStream {
     type ConnectInfo = TcpConnectInfo;
 
