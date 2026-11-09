@@ -148,7 +148,6 @@ impl crate::clock::ClockProbe for UhdClockProbe<'_> {
 pub struct UhdRadio {
     tx_rate_hz: f64,
     rx_rate_hz: f64,
-    usrp: Usrp,
     channel: usize,
     rx_channel: usize,
     master_clock_rate: u64,
@@ -164,6 +163,8 @@ pub struct UhdRadio {
     tx_correction: TxFrequencyCorrection,
     tx_streamer: Option<TransmitStreamer<Complex32>>,
     rx_streamer: Option<ReceiveStreamer<Complex32>>,
+    // Must drop after the streamers. SoapyUHD streamers crash if the device goes first.
+    usrp: Usrp,
 }
 
 impl UhdRadio {
@@ -600,8 +601,9 @@ impl Radio for UhdRadio {
 
 struct UhdTxHalf {
     tx_rate_hz: f64,
-    usrp: Arc<SharedUsrp>,
     tx_streamer: TransmitStreamer<Complex32>,
+    // Must drop after the streamer.
+    usrp: Arc<SharedUsrp>,
     master_clock_rate: u64,
     start_of_burst: bool,
     health: TxRadioHealth,
@@ -838,8 +840,9 @@ fn finish_tx_send(
 
 struct UhdRxHalf {
     rx_rate_hz: f64,
-    usrp: Arc<SharedUsrp>,
     rx_streamer: ReceiveStreamer<Complex32>,
+    // Must drop after the streamer.
+    usrp: Arc<SharedUsrp>,
     master_clock_rate: u64,
     channel: usize,
 }
