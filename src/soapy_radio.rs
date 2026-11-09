@@ -266,8 +266,9 @@ impl SoapyTxHalf {
         } else {
             Ok(())
         };
-        let deactivate_result = self.stream.deactivate(tick.map(|t| t as i64));
-        deactivate_result?;
+        if self.stream.active() {
+            self.stream.deactivate(tick.map(|t| t as i64))?;
+        }
         self.active = false;
         end_result?;
         Ok(())
@@ -545,7 +546,9 @@ impl RadioRx for SoapyRxHalf {
     }
 
     fn stop(&mut self) -> Result<(), Error> {
-        self.stream.deactivate(None)?;
+        if self.stream.active() {
+            self.stream.deactivate(None)?;
+        }
         Ok(())
     }
 

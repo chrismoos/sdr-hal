@@ -1,4 +1,5 @@
 # HEAD
+- Fixed Soapy `stop()` failing with "Stream is not active" on a TX or RX stream that was never started.
 
 # v0.1.1
 - A new radiod client can set different rates and bandwidths after the previous client disconnects.
