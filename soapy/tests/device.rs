@@ -265,10 +265,14 @@ fn ramp_index(sample: Complex32) -> u64 {
 fn start_server(state: Arc<Mutex<FakeState>>, composite: Option<CompositeConfig>) -> SocketAddr {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let radio = Box::new(FakeRadio {
-            state,
-            clock: Arc::new(Clock(Instant::now())),
-        });
+        let clock = Arc::new(Clock(Instant::now()));
+        let open = move || -> Result<Box<dyn Radio>, Error> {
+            Ok(Box::new(FakeRadio {
+                state: state.clone(),
+                clock: clock.clone(),
+            }))
+        };
+        let radio = open().expect("fake radio");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -278,6 +282,7 @@ fn start_server(state: Arc<Mutex<FakeState>>, composite: Option<CompositeConfig>
             let localhost = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
             let serve_fut = serve(
                 radio,
+                Box::new(open),
                 true,
                 "soapy-fake".to_string(),
                 RxDefaults::default(),
