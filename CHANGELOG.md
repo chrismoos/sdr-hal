@@ -1,4 +1,6 @@
 # HEAD
+
+# v0.1.2
 - Fixed Soapy `stop()` failing with "Stream is not active" on a TX or RX stream that was never started.
 
 # v0.1.1
