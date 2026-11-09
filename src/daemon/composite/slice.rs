@@ -367,10 +367,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            super::super::grid_block_samples(DEVICE_RATE).unwrap(),
-            DEVICE_BLOCK
-        );
+        assert_eq!(config.grid_block_samples().unwrap(), DEVICE_BLOCK);
         let mut transmitters = plans
             .iter()
             .map(|p| TxSlice::new(p, DEVICE_RATE, 1.0))

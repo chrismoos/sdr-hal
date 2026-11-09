@@ -73,7 +73,8 @@ mod tests {
             "device_rate_hz": 3888000,
             "tx_center_hz": 867520000,
             "rx_center_hz": 822520000,
-            "tx_digital_backoff_db": -12.0
+            "tx_digital_backoff_db": -12.0,
+            "block_duration_ms": 0.8333333333333334
         }
     }"#;
 
@@ -203,10 +204,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name} does not fit: {e}"));
             assert_eq!((plan.ratio, plan.offset_hz), (10, offset_hz), "{name}");
         }
-        assert_eq!(
-            crate::daemon::composite::grid_block_samples(3_888_000).unwrap(),
-            3_240
-        );
+        assert_eq!(composite.grid_block_samples().unwrap(), 3_240);
     }
 
     #[test]

@@ -39,12 +39,11 @@ impl TxFrequencyCorrection {
         lo_offset_hz: f64,
     ) -> Result<TuneRequest, Error> {
         if self.is_software() {
-            if lo_offset_hz != 0.0 {
-                return Err(Error::invalid_setting(
-                    "software UHD TX frequency correction requires zero TX LO offset",
-                ));
-            }
-            let mut request = TuneRequest::with_frequency(carrier_hz);
+            let mut request = if lo_offset_hz != 0.0 {
+                TuneRequest::with_frequency_lo(carrier_hz, lo_offset_hz)
+            } else {
+                TuneRequest::with_frequency(carrier_hz)
+            };
             request.set_dsp_policy(TuneRequestPolicy::Manual(0.0));
             Ok(request)
         } else if lo_offset_hz != 0.0 {
@@ -250,7 +249,6 @@ mod tests {
                 .samples(&input, Schedule::Immediate, SAMPLE_RATE_HZ, TICK_RATE)
                 .is_err()
         );
-        assert!(correction.tune_request(CARRIER_HZ, 1.0).is_err());
         assert!(
             correction
                 .update_tune(CARRIER_HZ, ACTUAL_RF_HZ, 0.5)
@@ -262,6 +260,32 @@ mod tests {
                 .is_err()
         );
         assert!(correction.update_tune(CARRIER_HZ, f64::NAN, 0.0).is_err());
+    }
+
+    #[test]
+    fn software_mode_shifts_a_tx_lo_offset_back_to_the_carrier() {
+        const LO_OFFSET_HZ: f64 = 200_000.0;
+        let mut correction = TxFrequencyCorrection::software();
+        assert!(correction.tune_request(CARRIER_HZ, LO_OFFSET_HZ).is_ok());
+        correction
+            .update_tune(CARRIER_HZ, ACTUAL_RF_HZ + LO_OFFSET_HZ, 0.0)
+            .unwrap();
+        let input = vec![Complex32::new(0.25, -0.5); SAMPLES];
+        let output = correction
+            .samples(&input, at(START_TICK), SAMPLE_RATE_HZ, TICK_RATE)
+            .unwrap();
+        let shift_hz = CARRIER_HZ - (ACTUAL_RF_HZ + LO_OFFSET_HZ);
+        let max_error = input
+            .iter()
+            .zip(output)
+            .enumerate()
+            .map(|(n, (&sample, &actual))| {
+                let time = START_TICK as f64 / TICK_RATE as f64 + n as f64 / SAMPLE_RATE_HZ;
+                let phase = std::f64::consts::TAU * shift_hz * time;
+                (actual - sample * Complex32::new(phase.cos() as f32, phase.sin() as f32)).norm()
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(max_error < ERROR_LIMIT, "max_error={max_error}");
     }
 
     #[test]

@@ -263,7 +263,6 @@ impl TxGrid {
         self.slots.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn block_samples(&self) -> usize {
         self.block_samples
     }
@@ -464,7 +463,7 @@ impl TxGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::composite::{CompositeConfig, Direction, grid_block_samples};
+    use crate::daemon::composite::{CompositeConfig, Direction};
 
     const PLAN: CompositeConfig = CompositeConfig {
         device_rate_hz: 3_888_000,
@@ -490,7 +489,7 @@ mod tests {
     }
 
     fn grid() -> TxGrid {
-        let block = grid_block_samples(PLAN.device_rate_hz).unwrap();
+        let block = PLAN.grid_block_samples().unwrap();
         TxGrid::new(PLAN.device_rate_hz, TICK_RATE, block).unwrap()
     }
 
@@ -607,7 +606,7 @@ mod tests {
                 Some(30_000),
             )
             .unwrap();
-        let block_samples = grid_block_samples(PLAN.device_rate_hz).unwrap();
+        let block_samples = PLAN.grid_block_samples().unwrap();
         let mut grid = TxGrid::new(PLAN.device_rate_hz, TICK_RATE, block_samples).unwrap();
         let first = grid.add_slot(&plan, PLAN.device_rate_hz, 1.0);
         let second = grid.add_slot(&plan, PLAN.device_rate_hz, 1.0);

@@ -43,6 +43,7 @@ const MAX_TIMING_MS: f64 = 1000.0;
 fn default_block_duration_ms() -> f64 {
     DEFAULT_BLOCK_DURATION_MS
 }
+
 fn default_tx_deadline_ms() -> f64 {
     DEFAULT_TX_DEADLINE_MS
 }
@@ -68,7 +69,7 @@ pub struct CompositeConfig {
     /// depend on how many clients are attached, so a client's output level never moves
     /// when a peer connects or leaves.
     pub tx_digital_backoff_db: f64,
-    /// Output block duration in milliseconds, rounded to whole device samples.
+    /// Output block duration in milliseconds, rounded to the nearest whole device sample.
     #[serde(default = "default_block_duration_ms")]
     pub block_duration_ms: f64,
     /// Milliseconds before output starts at which missing client samples become silence.
@@ -130,23 +131,23 @@ impl CompositeConfig {
             )
             .into());
         }
-        for (name, value, minimum) in [
-            (
-                "block_duration_ms",
-                self.block_duration_ms,
-                f64::MIN_POSITIVE,
-            ),
-            ("tx_deadline_ms", self.tx_deadline_ms, 0.0),
-        ] {
-            if !value.is_finite() || value < minimum || value > MAX_TIMING_MS {
-                return Err(format!("composite.{name} must be finite and between {minimum} and {MAX_TIMING_MS} ms, not {value}").into());
-            }
+        let deadline = self.tx_deadline_ms;
+        if !deadline.is_finite() || !(0.0..=MAX_TIMING_MS).contains(&deadline) {
+            return Err(format!("composite.tx_deadline_ms must be finite and between 0 and {MAX_TIMING_MS} ms, not {deadline}").into());
         }
         self.grid_block_samples().map(|_| ())
     }
 
     pub(crate) fn grid_block_samples(&self) -> Result<usize, Error> {
-        grid_block_samples_at_duration(self.device_rate_hz, self.block_duration_ms)
+        let duration = self.block_duration_ms;
+        if !duration.is_finite() || duration <= 0.0 || duration > MAX_TIMING_MS {
+            return Err(format!("composite.block_duration_ms must be finite, positive and at most {MAX_TIMING_MS} ms, not {duration}").into());
+        }
+        let block = (self.device_rate_hz as f64 * duration / 1000.0).round();
+        if block < 1.0 || block > MAX_GRID_BLOCK_SAMPLES as f64 {
+            return Err(format!("composite.block_duration_ms of {duration} ms rounds to {block} device samples, outside 1..={MAX_GRID_BLOCK_SAMPLES}").into());
+        }
+        Ok(block as usize)
     }
 
     /// Checks a device against this plan, naming every reason it cannot serve it.
@@ -368,28 +369,6 @@ impl CompositeConfig {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn grid_block_samples(device_rate_hz: u64) -> Result<usize, Error> {
-    grid_block_samples_at_duration(device_rate_hz, 5.0 / 6.0)
-}
-
-fn grid_block_samples_at_duration(device_rate_hz: u64, duration_ms: f64) -> Result<usize, Error> {
-    let block = (device_rate_hz as f64 * duration_ms / 1000.0).round();
-    if block < 1.0 {
-        return Err(format!(
-            "composite.block_duration_ms of {duration_ms} ms is under one sample at {device_rate_hz} Hz"
-        )
-        .into());
-    }
-    if block > MAX_GRID_BLOCK_SAMPLES as f64 {
-        return Err(format!(
-            "composite.block_duration_ms of {duration_ms} ms needs a {block}-sample grid block, past the {MAX_GRID_BLOCK_SAMPLES} limit"
-        )
-        .into());
-    }
-    Ok(block as usize)
-}
-
 /// Smallest-term fraction `(ratio, denominator)` with `device * denominator / ratio`
 /// within [`RATE_MATCH_TOLERANCE_HZ`] of `client_rate_hz`, from the continued fraction of
 /// `device / client_rate_hz`.
@@ -421,6 +400,12 @@ fn device_fraction(device: u64, client_rate_hz: f64) -> Option<(u64, u64)> {
     None
 }
 
+/// Smallest device-sample step that spans whole client samples.
+pub(crate) fn block_sample_step(plan: &SlicePlan) -> usize {
+    let (ratio, denominator) = (plan.ratio as u64, plan.denominator as u64);
+    (ratio / gcd(ratio, denominator)) as usize
+}
+
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         (a, b) = (b, a % b);
@@ -444,65 +429,74 @@ mod tests {
     const CLIENT_RATE_HZ: u64 = 388_800;
 
     #[test]
-    fn timing_defaults_and_overrides_set_the_block_length_exactly() {
-        let config: CompositeConfig = serde_json::from_str(r#"{"device_rate_hz":9720000,"tx_center_hz":865200000,"rx_center_hz":820200000,"tx_digital_backoff_db":-3}"#).unwrap();
+    fn fractional_durations_round_to_whole_device_samples() {
+        let json = r#"{"device_rate_hz":6500000,"tx_center_hz":871400000,"rx_center_hz":826400000,"tx_digital_backoff_db":-3}"#;
+        let config: CompositeConfig = serde_json::from_str(json).unwrap();
         config.validate().unwrap();
         assert_eq!(config.block_duration_ms, 2.0);
         assert_eq!(config.tx_deadline_ms, 5.0);
-        assert_eq!(config.grid_block_samples().unwrap(), 19_440);
-        let smaller = CompositeConfig {
-            block_duration_ms: 5.0 / 6.0,
-            tx_deadline_ms: 2.0,
+        assert_eq!(config.grid_block_samples().unwrap(), 13_000);
+        for (block_duration_ms, expected) in [
+            (1.8461538461538463, 12_000),
+            (1.5001, 9_751),
+            (1.50001, 9_750),
+        ] {
+            assert_eq!(
+                CompositeConfig {
+                    block_duration_ms,
+                    ..config
+                }
+                .grid_block_samples()
+                .unwrap(),
+                expected
+            );
+        }
+        let faster = CompositeConfig {
+            device_rate_hz: 13_000_000,
             ..config
         };
-        smaller.validate().unwrap();
-        assert_eq!(smaller.grid_block_samples().unwrap(), 8_100);
-        for duration in [0.0, -1.0, f64::NAN, f64::INFINITY, MAX_TIMING_MS + 1.0] {
+        assert_eq!(faster.grid_block_samples().unwrap(), 26_000);
+        let with_samples = json.replace(
+            "\"tx_digital_backoff_db\":-3",
+            "\"tx_digital_backoff_db\":-3,\"block_samples\":12000",
+        );
+        assert!(serde_json::from_str::<CompositeConfig>(&with_samples).is_err());
+        for block_duration_ms in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            MAX_TIMING_MS + 1.0,
+            0.000001,
+        ] {
             assert!(
                 CompositeConfig {
-                    block_duration_ms: duration,
+                    block_duration_ms,
                     ..config
                 }
                 .validate()
                 .is_err()
             );
         }
-        for duration in [-1.0, f64::NAN, f64::INFINITY, MAX_TIMING_MS + 1.0] {
+        assert!(
+            CompositeConfig {
+                device_rate_hz: 61_440_000,
+                block_duration_ms: MAX_TIMING_MS,
+                ..config
+            }
+            .validate()
+            .is_err()
+        );
+        for tx_deadline_ms in [-1.0, f64::NAN, f64::INFINITY, MAX_TIMING_MS + 1.0] {
             assert!(
                 CompositeConfig {
-                    tx_deadline_ms: duration,
+                    tx_deadline_ms,
                     ..config
                 }
                 .validate()
                 .is_err()
             );
         }
-    }
-
-    #[test]
-    fn a_block_under_one_sample_or_past_the_limit_is_refused() {
-        let tiny = CompositeConfig {
-            device_rate_hz: 1_000,
-            block_duration_ms: 0.1,
-            ..PLAN
-        };
-        assert!(
-            tiny.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("under one sample")
-        );
-        let huge = CompositeConfig {
-            device_rate_hz: 61_440_000,
-            block_duration_ms: MAX_TIMING_MS,
-            ..PLAN
-        };
-        assert!(
-            huge.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("past the")
-        );
     }
 
     #[test]

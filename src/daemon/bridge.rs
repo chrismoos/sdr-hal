@@ -1,6 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::clock::{ClockSampler, device_time};
@@ -481,6 +481,7 @@ enum PacketSource {
 
 /// Settings for the TX worker. Both clock and sample rates must be positive.
 pub struct TxBridge {
+    pub(super) timing_clock: Arc<OnceLock<Arc<crate::network::clock::NetworkClock>>>,
     /// Open sessions and the grid slot each one feeds.
     pub sessions: Arc<Sessions>,
     /// Native hardware ticks per second for timestamp conversion.
@@ -507,6 +508,7 @@ struct TxSlotState {
     watchdog: TxSilenceWatchdog,
     /// Whether this client asked to transmit. The device runs while any slot has.
     enabled: bool,
+    arrival: TxArrivalTiming,
 }
 
 impl TxSlotState {
@@ -517,12 +519,32 @@ impl TxSlotState {
             sample_rate_hz,
             watchdog: TxSilenceWatchdog::default(),
             enabled: false,
+            arrival: TxArrivalTiming::default(),
         }
     }
 }
 
-/// Logs what staging did with a client block, since a grid slot that already went out
-/// cannot be filled retrospectively.
+fn warn_on_partial_block(
+    slot: usize,
+    plan: &crate::daemon::composite::SlicePlan,
+    block_samples: usize,
+    device_rate_hz: u64,
+) {
+    let step = crate::daemon::composite::block_sample_step(plan);
+    if block_samples.is_multiple_of(step) {
+        return;
+    }
+    let below = block_samples / step * step;
+    let above = below + step;
+    warn!(
+        "radiod: composite TX slot {slot} grid block of {block_samples} device samples spans \
+         {:.4} client samples, not a whole number. For whole client-sample boundaries, \
+         composite.block_duration_ms={:.9} gives {above} device samples (a multiple of {step})",
+        block_samples as f64 * plan.denominator as f64 / plan.ratio as f64,
+        above as f64 * 1000.0 / device_rate_hz as f64
+    );
+}
+
 fn log_staged(slot: usize, block_id: u32, outcome: Staged) {
     match outcome {
         Staged::Placed { rounded_samples: 0 } => {}
@@ -595,10 +617,46 @@ fn report_tx_health(tx: &mut dyn RadioTx, last: &mut TxRadioHealth) {
 }
 
 #[derive(Default)]
+struct TxArrivalTiming {
+    packets: u64,
+    past_due_at_receipt: u64,
+    min_receipt_lead_us: Option<f64>,
+    max_receipt_lead_us: Option<f64>,
+    min_processing_lead_us: Option<f64>,
+    max_queue_us: f64,
+}
+
+impl TxArrivalTiming {
+    fn observe(&mut self, target: u64, now: u64, tick_rate: u64, queue_age: Duration) {
+        let processing_lead_us =
+            (i128::from(target) - i128::from(now)) as f64 * 1_000_000.0 / tick_rate as f64;
+        let queue_us = queue_age.as_secs_f64() * 1_000_000.0;
+        let receipt_lead_us = processing_lead_us + queue_us;
+        self.packets += 1;
+        self.past_due_at_receipt += u64::from(receipt_lead_us < 0.0);
+        self.min_receipt_lead_us = Some(
+            self.min_receipt_lead_us
+                .map_or(receipt_lead_us, |v| v.min(receipt_lead_us)),
+        );
+        self.max_receipt_lead_us = Some(
+            self.max_receipt_lead_us
+                .map_or(receipt_lead_us, |v| v.max(receipt_lead_us)),
+        );
+        self.min_processing_lead_us = Some(
+            self.min_processing_lead_us
+                .map_or(processing_lead_us, |v| v.min(processing_lead_us)),
+        );
+        self.max_queue_us = self.max_queue_us.max(queue_us);
+    }
+}
+
+#[derive(Default)]
 struct CompositeTxTiming {
     max_loop_gap: Duration,
     max_clock_query: Duration,
     max_clock_refresh: Duration,
+    rejected_clock_queries: u64,
+    clock_query_uncertainty_us: u64,
     max_synthesis: Duration,
     max_write: Duration,
     max_packet_queue: Duration,
@@ -891,6 +949,11 @@ impl TxBridge {
             },
             None => None,
         };
+        if let Some(cache) = clock_cache.as_ref()
+            && self.timing_clock.set(cache.shared_clock()).is_err()
+        {
+            warn!("radiod: RX timing clock was already initialized");
+        }
         let mut samples: Vec<Complex32> = Vec::new();
         let mut scratch: Vec<u8> = Vec::new();
         let mut slots: Vec<TxSlotState> = self
@@ -998,6 +1061,12 @@ impl TxBridge {
                                 info!(
                                     "radiod: composite TX slot {index} at {:+} Hz, {}/{} device samples per client sample",
                                     plan.offset_hz, plan.ratio, plan.denominator
+                                );
+                                warn_on_partial_block(
+                                    index,
+                                    &plan,
+                                    grid.block_samples(),
+                                    self.device_rate_hz,
                                 );
                                 Ok(index)
                             }
@@ -1112,6 +1181,18 @@ impl TxBridge {
                             continue;
                         };
                         slots[index].diag.observe(header.seq);
+                        if header.sample_count > 0
+                            && header.flags & FLAG_TX_NO_TICK == 0
+                            && let Some(cache) = clock_cache.as_ref()
+                        {
+                            let now = cache.now_ticks();
+                            slots[index].arrival.observe(
+                                header.time_ticks,
+                                now,
+                                self.tick_rate,
+                                received_at.elapsed(),
+                            );
+                        }
                         if header.flags & FLAG_TX_ENABLE != 0 {
                             if header.sample_count != 0 || header.flags & FLAG_TX_DISABLE != 0 {
                                 warn!("radiod: dropping invalid TX enable fence");
@@ -1317,8 +1398,11 @@ impl TxBridge {
                 }
                 timing.max_clock_query = timing.max_clock_query.max(clock_query.elapsed());
                 if let Some(cache) = clock_cache.as_ref() {
+                    let diagnostics = cache.take_diagnostics();
                     timing.max_clock_refresh =
-                        timing.max_clock_refresh.max(cache.take_max_refresh());
+                        timing.max_clock_refresh.max(diagnostics.max_refresh);
+                    timing.rejected_clock_queries += diagnostics.rejected_queries;
+                    timing.clock_query_uncertainty_us = diagnostics.uncertainty_us;
                 }
                 let emit_started = Instant::now();
                 while emit_started.elapsed() < COMPOSITE_EMIT_BUDGET {
@@ -1364,16 +1448,32 @@ impl TxBridge {
 
             if self.grid.is_some() && last_timing_report.elapsed() >= COMPOSITE_TIMING_INTERVAL {
                 info!(
-                    "radiod: composite TX timing: max_loop_gap_us={} max_clock_query_us={} max_clock_refresh_us={} max_synthesis_us={} max_write_us={} max_packet_queue_us={} max_packet_backlog={} min_estimated_write_lead_us={:?}",
+                    "radiod: composite TX timing: max_loop_gap_us={} max_clock_query_us={} max_clock_refresh_us={} rejected_clock_queries={} clock_query_uncertainty_us={} max_synthesis_us={} max_write_us={} max_packet_queue_us={} max_packet_backlog={} min_estimated_write_lead_us={:?}",
                     timing.max_loop_gap.as_micros(),
                     timing.max_clock_query.as_micros(),
                     timing.max_clock_refresh.as_micros(),
+                    timing.rejected_clock_queries,
+                    timing.clock_query_uncertainty_us,
                     timing.max_synthesis.as_micros(),
                     timing.max_write.as_micros(),
                     timing.max_packet_queue.as_micros(),
                     timing.max_packet_backlog,
                     timing.min_estimated_write_lead_us
                 );
+                for (index, slot) in slots.iter_mut().enumerate() {
+                    let arrival = std::mem::take(&mut slot.arrival);
+                    if arrival.packets > 0 {
+                        info!(
+                            "radiod: composite slot {index} TX arrival timing: timed_packets={} past_due_at_receipt={} min_estimated_receipt_lead_us={:?} max_estimated_receipt_lead_us={:?} min_estimated_processing_lead_us={:?} max_queue_us={:.3}",
+                            arrival.packets,
+                            arrival.past_due_at_receipt,
+                            arrival.min_receipt_lead_us,
+                            arrival.max_receipt_lead_us,
+                            arrival.min_processing_lead_us,
+                            arrival.max_queue_us
+                        );
+                    }
+                }
                 timing = CompositeTxTiming::default();
                 last_timing_report = Instant::now();
             }
@@ -1554,9 +1654,52 @@ fn stage_block(
     log_staged(slot, block.block_id, outcome);
 }
 
+#[derive(Default)]
+struct RxSampleAge {
+    packets: u64,
+    min_first_age_us: Option<f64>,
+    max_first_age_us: Option<f64>,
+    min_last_age_us: Option<f64>,
+    max_last_age_us: Option<f64>,
+}
+
+impl RxSampleAge {
+    fn observe(&mut self, now: u64, first: u64, last: u64, tick_rate: u64) {
+        let age =
+            |ticks| (i128::from(now) - i128::from(ticks)) as f64 * 1_000_000.0 / tick_rate as f64;
+        let first_age = age(first);
+        let last_age = age(last);
+        self.packets += 1;
+        self.min_first_age_us = Some(
+            self.min_first_age_us
+                .map_or(first_age, |v| v.min(first_age)),
+        );
+        self.max_first_age_us = Some(
+            self.max_first_age_us
+                .map_or(first_age, |v| v.max(first_age)),
+        );
+        self.min_last_age_us = Some(self.min_last_age_us.map_or(last_age, |v| v.min(last_age)));
+        self.max_last_age_us = Some(self.max_last_age_us.map_or(last_age, |v| v.max(last_age)));
+    }
+
+    fn report(&self, stage: &str, slot: Option<usize>) {
+        if self.packets > 0 {
+            info!(
+                "radiod: composite RX sample age: stage={stage} slot={slot:?} observations={} min_estimated_first_age_us={:?} max_estimated_first_age_us={:?} min_estimated_last_age_us={:?} max_estimated_last_age_us={:?}",
+                self.packets,
+                self.min_first_age_us,
+                self.max_first_age_us,
+                self.min_last_age_us,
+                self.max_last_age_us
+            );
+        }
+    }
+}
+
 /// Commands for the RX worker beyond the stream controls, used by composite mode.
 /// Settings for the RX worker. Clock rate and packet sample count must be positive.
 pub struct RxBridge {
+    pub(super) timing_clock: Arc<OnceLock<Arc<crate::network::clock::NetworkClock>>>,
     /// Open sessions and the fan-out slot each one reads.
     pub sessions: Arc<Sessions>,
     /// Native hardware ticks per second for timestamp conversion.
@@ -1598,6 +1741,13 @@ impl RxBridge {
         let mut seqs: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut active = false;
         let mut delivered = false;
+        let mut last_age_report = Instant::now();
+        let mut read_age = RxSampleAge::default();
+        let mut last_read_finished: Option<Instant> = None;
+        let mut max_between_reads = Duration::ZERO;
+        let mut max_read = Duration::ZERO;
+        let mut max_forward = Duration::ZERO;
+        let mut forward_ages: Vec<RxSampleAge> = Vec::new();
         let mut last_generation = self.sessions.generation();
 
         loop {
@@ -1638,6 +1788,11 @@ impl RxBridge {
                     std::thread::sleep(RETURN_PATH_POLL);
                     continue;
                 }
+                let read_started = Instant::now();
+                if let Some(finished) = last_read_finished {
+                    max_between_reads =
+                        max_between_reads.max(read_started.duration_since(finished));
+                }
                 let result = match rx.rx_read(&mut buf, RX_READ_TIMEOUT_US) {
                     Ok(result) => result,
                     Err(e) => {
@@ -1646,10 +1801,42 @@ impl RxBridge {
                         continue;
                     }
                 };
+                let read_finished = Instant::now();
+                max_read = max_read.max(read_finished.duration_since(read_started));
+                last_read_finished = Some(read_finished);
                 if result.samples_read == 0 {
                     continue;
                 }
                 if let Some(fanout) = self.fanout.as_mut() {
+                    if let Some(clock) = self.timing_clock.get() {
+                        let last = result.time_ticks.saturating_add(wire::samples_to_ticks(
+                            (result.samples_read - 1) as u64,
+                            self.tick_rate,
+                            self.device_rate_hz as f64,
+                        ));
+                        read_age.observe(
+                            clock.now_ticks(),
+                            result.time_ticks,
+                            last,
+                            self.tick_rate,
+                        );
+                    }
+                    if last_age_report.elapsed() >= COMPOSITE_TIMING_INTERVAL {
+                        info!(
+                            "radiod: composite RX timing: max_between_reads_us={} max_read_us={} max_forward_us={}",
+                            max_between_reads.as_micros(),
+                            max_read.as_micros(),
+                            max_forward.as_micros()
+                        );
+                        max_between_reads = Duration::ZERO;
+                        max_read = Duration::ZERO;
+                        max_forward = Duration::ZERO;
+                        std::mem::take(&mut read_age).report("read_complete", None);
+                        for (index, age) in forward_ages.iter_mut().enumerate() {
+                            std::mem::take(age).report("forward_complete", Some(index));
+                        }
+                        last_age_report = Instant::now();
+                    }
                     // Every client reads the same device block through its own slice,
                     // so one slow consumer never reorders another's stream.
                     for session in &open {
@@ -1709,10 +1896,32 @@ impl RxBridge {
                                 debug!("radiod: rx send failed: {e}");
                                 break;
                             }
+                            if let Some(clock) = self.timing_clock.get() {
+                                if index >= forward_ages.len() {
+                                    forward_ages.resize_with(index + 1, RxSampleAge::default);
+                                }
+                                let first = slice_ticks.saturating_add(wire::samples_to_ticks(
+                                    offset as u64,
+                                    self.tick_rate,
+                                    rate,
+                                ));
+                                let last = slice_ticks.saturating_add(wire::samples_to_ticks(
+                                    (end - 1) as u64,
+                                    self.tick_rate,
+                                    rate,
+                                ));
+                                forward_ages[index].observe(
+                                    clock.now_ticks(),
+                                    first,
+                                    last,
+                                    self.tick_rate,
+                                );
+                            }
                             delivered = true;
                             offset = end;
                         }
                     }
+                    max_forward = max_forward.max(read_finished.elapsed());
                     continue;
                 }
                 let Some(session) = open.first() else {

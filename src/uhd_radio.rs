@@ -260,7 +260,7 @@ impl UhdRadio {
         Ok(radio)
     }
 
-    /// Select before tuning. Software correction requires timed TX and zero LO offset.
+    /// Select before tuning. Software correction requires timed TX.
     pub fn with_software_tx_frequency_correction(mut self, enabled: bool) -> Self {
         self.tx_correction = if enabled {
             TxFrequencyCorrection::software()
@@ -450,11 +450,6 @@ impl Radio for UhdRadio {
     }
 
     fn set_tx_lo_offset_hz(&mut self, offset_hz: i64) -> Result<(), Error> {
-        if self.tx_correction.is_software() && offset_hz != 0 {
-            return Err(Error::invalid_setting(
-                "software UHD TX frequency correction requires zero TX LO offset",
-            ));
-        }
         self.tx_lo_offset_hz = offset_hz as f64;
         Ok(())
     }

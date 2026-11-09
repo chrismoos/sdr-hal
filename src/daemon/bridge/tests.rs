@@ -293,3 +293,31 @@ fn packets_queued_beyond_one_batch_fill_the_grid_before_silence_is_committed() {
     assert_eq!(actual.time_ticks, expected.time_ticks);
     assert_eq!(actual.samples, expected.samples);
 }
+
+#[test]
+fn arrival_lead_separates_client_lateness_from_compositor_queue_delay() {
+    let mut timing = TxArrivalTiming::default();
+    timing.observe(9_000, 10_000, 1_000_000, Duration::from_millis(2));
+    assert_eq!(timing.min_receipt_lead_us, Some(1_000.0));
+    assert_eq!(timing.min_processing_lead_us, Some(-1_000.0));
+    assert_eq!(timing.past_due_at_receipt, 0);
+    timing.observe(7_000, 10_000, 1_000_000, Duration::from_millis(2));
+    assert_eq!(timing.min_receipt_lead_us, Some(-1_000.0));
+    assert_eq!(timing.max_receipt_lead_us, Some(1_000.0));
+    assert_eq!(timing.min_processing_lead_us, Some(-3_000.0));
+    assert_eq!(timing.max_queue_us, 2_000.0);
+    assert_eq!(timing.packets, 2);
+    assert_eq!(timing.past_due_at_receipt, 1);
+}
+
+#[test]
+fn rx_age_distinguishes_packet_duration_and_preserves_future_timestamp_errors() {
+    let mut age = RxSampleAge::default();
+    age.observe(10_000, 6_000, 8_000, 1_000_000);
+    assert_eq!(age.max_first_age_us, Some(4_000.0));
+    assert_eq!(age.max_last_age_us, Some(2_000.0));
+    age.observe(10_000, 11_000, 12_000, 1_000_000);
+    assert_eq!(age.min_first_age_us, Some(-1_000.0));
+    assert_eq!(age.min_last_age_us, Some(-2_000.0));
+    assert_eq!(age.packets, 2);
+}

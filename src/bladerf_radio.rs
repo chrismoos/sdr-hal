@@ -52,7 +52,7 @@ impl SyncStreamConfig {
 
 /// A bladeRF radio using synchronous TX and optional RX. Timestamps count sample-clock
 /// ticks, and samples use the driver's SC16 Q11 format.
-/// RX activation starts immediately. The FPGA must already be configured or an image supplied.
+/// RX starts on the first read after activation. The FPGA must already be configured or an image supplied.
 pub struct BladeRfRadio {
     rx_rate_hz: f64,
     device: Device,
@@ -249,6 +249,14 @@ impl Radio for BladeRfRadio {
         self.sample_rate as u64
     }
 
+    fn hardware_time(&self) -> Result<u64, Error> {
+        // Zero until split() enables a module and the counter starts.
+        Ok(self
+            .device
+            .get_timestamp(bladerf::direction::TX)
+            .unwrap_or(0))
+    }
+
     fn set_tx_frequency(&mut self, center_frequency: usize) -> Result<(), Error> {
         crate::stream::positive_hz(center_frequency as f64, "set_tx_frequency")?;
         let rf_freq = crate::stream::frequency_u64(center_frequency as f64 + self.tx_lo_offset_hz)?;
@@ -442,14 +450,6 @@ impl Radio for BladeRfRadio {
         };
 
         let rx = if self.rx_configured {
-            device
-                .enable_module(rx_channel(self.channel), true)
-                .map_err(|e| {
-                    let context = format!("bladeRF: enable RX module: {}", e);
-                    Error::from(e).context(context)
-                })?;
-            info!("bladeRF: RX module enabled");
-
             let rx_sync = RxSync::new(&device);
             Some(Box::new(BladeRfRxHalf {
                 rx_rate_hz: self.rx_rate_hz,
@@ -459,7 +459,8 @@ impl Radio for BladeRfRadio {
                 channel: self.channel,
                 sample_rate: self.rx_rate_hz.round() as u32,
                 shared_clock: shared_clock.clone(),
-                module_enabled: true,
+                module_enabled: false,
+                activation_requested: true,
                 sc16_scratch: Vec::with_capacity(self.buffer_size as usize),
             }) as Box<dyn RadioRx>)
         } else {
@@ -489,7 +490,29 @@ struct BladeRfTxHalf {
     health: TxRadioHealth,
 }
 
+/// Reads the FPGA timestamp without holding the stream owner, since the read goes over USB.
+struct BladeRfClockReader {
+    device: Arc<Device>,
+    shared_clock: Arc<AtomicU64>,
+}
+
+impl crate::RadioClock for BladeRfClockReader {
+    fn get_hardware_time(&self) -> Result<u64, Error> {
+        match self.device.get_timestamp(bladerf::direction::TX) {
+            Ok(ts) if ts > 0 => Ok(ts),
+            _ => Ok(self.shared_clock.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 impl RadioTx for BladeRfTxHalf {
+    fn clock_reader(&self) -> Option<Box<dyn crate::RadioClock>> {
+        Some(Box::new(BladeRfClockReader {
+            device: Arc::clone(&self._device),
+            shared_clock: Arc::clone(&self.shared_clock),
+        }))
+    }
+
     fn capabilities(&self) -> crate::TxCapabilities {
         crate::TxCapabilities::from([
             crate::TxCapability::TimedSamples,
@@ -634,6 +657,7 @@ struct BladeRfRxHalf {
     sample_rate: u32,
     shared_clock: Arc<AtomicU64>,
     module_enabled: bool,
+    activation_requested: bool,
     sc16_scratch: Vec<Sc16Q11>,
 }
 
@@ -685,6 +709,22 @@ impl RadioRx for BladeRfRxHalf {
                 .map_err(|_| Error::invalid_setting("RX timeout exceeds u32 milliseconds"))?
         };
 
+        if !self.activation_requested {
+            return Err(Error::invalid_setting("bladeRF: RX stream is stopped"));
+        }
+        // Starting RX before a reader is ready leaves old samples queued in the device.
+        if !self.module_enabled {
+            self.stream_config
+                .configure(&self._device, bladerf::layout::RX_X1)?;
+            self._device
+                .enable_module(rx_channel(self.channel), true)
+                .map_err(|e| {
+                    let context = format!("bladeRF: enable RX: {}", e);
+                    Error::from(e).context(context)
+                })?;
+            self.module_enabled = true;
+            info!("bladeRF: RX module enabled for first read");
+        }
         self.sc16_scratch.resize(buf.len(), Sc16Q11::default());
         let mut meta = StreamMeta {
             flags: FLAG_RX_NOW,
@@ -727,21 +767,12 @@ impl RadioRx for BladeRfRxHalf {
         if time_ticks.is_some() {
             return Err(Error::unsupported("timed RX activation"));
         }
-        if !self.module_enabled {
-            self.stream_config
-                .configure(&self._device, bladerf::layout::RX_X1)?;
-            self._device
-                .enable_module(rx_channel(self.channel), true)
-                .map_err(|e| {
-                    let context = format!("bladeRF: enable RX: {}", e);
-                    Error::from(e).context(context)
-                })?;
-            self.module_enabled = true;
-        }
+        self.activation_requested = true;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), Error> {
+        self.activation_requested = false;
         if self.module_enabled {
             self._device
                 .enable_module(rx_channel(self.channel), false)

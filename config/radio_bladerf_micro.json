@@ -7,7 +7,7 @@
   "rx_antenna": "A_BALANCED",
   "rx_gain_db": 30,
   "num_buffers": 16,
-  "buffer_size": 8192,
+  "buffer_size": 2048,
   "num_transfers": 8,
   "stream_timeout_ms": 3500,
   "tx_sample_rate_hz": 2000000,

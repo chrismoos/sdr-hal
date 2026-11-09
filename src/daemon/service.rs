@@ -1,8 +1,8 @@
 #![allow(clippy::result_large_err)]
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::Radio;
 use crate::network::proto::radio_control_service_server::{
@@ -393,7 +393,9 @@ impl RadioControlSvc {
             TxGrid::new(config.device_rate_hz, tick_rate, block_samples).map_err(internal)?;
         let shared = &self.shared;
         let (tx_cmds, tx_cmd_rx) = crossbeam_channel::unbounded();
+        let timing_clock = Arc::new(OnceLock::new());
         let tx_bridge = TxBridge {
+            timing_clock: Arc::clone(&timing_clock),
             sessions: shared.sessions.clone(),
             tick_rate,
             slot_rates: Vec::new(),
@@ -419,6 +421,7 @@ impl RadioControlSvc {
                 let fanout = RxFanout::new(config.device_rate_hz, tick_rate).map_err(internal)?;
                 let (rx_cmds, rx_cmd_rx) = crossbeam_channel::unbounded();
                 let rx_bridge = RxBridge {
+                    timing_clock: Arc::clone(&timing_clock),
                     sessions: shared.sessions.clone(),
                     tick_rate,
                     rx_sample_rate_hz: shared.rx_sample_rate_hz.clone(),
@@ -442,11 +445,11 @@ impl RadioControlSvc {
         };
 
         info!(
-            "radiod: composite stream open at {} Hz, TX center {} Hz, RX center {} Hz, {block_samples}-sample grid block, {:.3} ms block target, {:.3} ms missing-data deadline, {:.1} dB slice headroom",
+            "radiod: composite stream open at {} Hz, TX center {} Hz, RX center {} Hz, {block_samples}-sample grid block, {:.3} ms per block, {:.3} ms missing-data deadline, {:.1} dB slice headroom",
             config.device_rate_hz,
             config.tx_center_hz,
             config.rx_center_hz,
-            config.block_duration_ms,
+            block_samples as f64 * 1000.0 / config.device_rate_hz as f64,
             config.tx_deadline_ms,
             config.tx_digital_backoff_db
         );
@@ -944,7 +947,9 @@ impl RadioControlService for RadioControlSvc {
                 });
 
                 let (tx_cmds, tx_cmd_rx) = crossbeam_channel::unbounded();
+                let timing_clock = Arc::new(OnceLock::new());
                 let tx_bridge = TxBridge {
+                    timing_clock: Arc::clone(&timing_clock),
                     sessions: shared.sessions.clone(),
                     tick_rate: recorded.tick_rate,
                     slot_rates: tx_sample_rate_hz.into_iter().collect(),
@@ -967,6 +972,7 @@ impl RadioControlService for RadioControlSvc {
                     Some(rx_half) => {
                         let (rx_cmds, rx_cmd_rx) = crossbeam_channel::unbounded();
                         let rx_bridge = RxBridge {
+                            timing_clock: Arc::clone(&timing_clock),
                             sessions: shared.sessions.clone(),
                             tick_rate: rx_half.tick_rate(),
                             rx_sample_rate_hz: shared.rx_sample_rate_hz.clone(),
@@ -1106,9 +1112,11 @@ impl RadioControlService for RadioControlSvc {
         request: Request<proto::RxActivateRequest>,
     ) -> Result<Response<()>, Status> {
         let key = client_key(&request);
-        let time_ticks = request.into_inner().time_ticks;
+        let mut time_ticks = request.into_inner().time_ticks;
         if let Some(registry) = self.composite() {
             let key = key?;
+            // One receiver serves every slice, so no client's start time applies to it.
+            time_ticks = None;
             // The receiver runs for the whole device, so only the first client starts it.
             let (active, slot, session_id, plan) = {
                 let mut guard = registry.lock();

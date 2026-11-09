@@ -181,8 +181,7 @@ impl Radio for SoapySdrRadio {
     }
 
     fn hardware_time(&self) -> Result<u64, Error> {
-        u64::try_from(self.device.get_hardware_time(None)?)
-            .map_err(|_| Error::invalid_setting("Soapy hardware time is negative"))
+        device_ticks(&self.device)
     }
 
     fn tx_gain_db(&self) -> Option<f64> {
@@ -325,7 +324,29 @@ impl SoapyTxHalf {
     }
 }
 
+fn device_ticks(device: &soapysdr::Device) -> Result<u64, Error> {
+    u64::try_from(device.get_hardware_time(None)?)
+        .map_err(|_| Error::invalid_setting("Soapy hardware time is negative"))
+}
+
+/// Reads device time without holding the stream owner, since the driver call can block.
+struct SoapyClockReader {
+    device: std::sync::Arc<soapysdr::Device>,
+}
+
+impl crate::RadioClock for SoapyClockReader {
+    fn get_hardware_time(&self) -> Result<u64, Error> {
+        device_ticks(&self.device)
+    }
+}
+
 impl RadioTx for SoapyTxHalf {
+    fn clock_reader(&self) -> Option<Box<dyn crate::RadioClock>> {
+        Some(Box::new(SoapyClockReader {
+            device: std::sync::Arc::clone(&self.device),
+        }))
+    }
+
     fn capabilities(&self) -> crate::TxCapabilities {
         let capabilities = crate::TxCapabilities::from([crate::TxCapability::BurstEnd]);
         if self.supports_timed_tx() {
@@ -400,8 +421,7 @@ impl RadioTx for SoapyTxHalf {
     }
 
     fn get_hardware_time(&self) -> Result<u64, Error> {
-        u64::try_from(self.device.get_hardware_time(None)?)
-            .map_err(|_| Error::invalid_setting("Soapy hardware time is negative"))
+        device_ticks(&self.device)
     }
 
     fn set_hardware_time(&self, ticks: u64) -> Result<(), Error> {
@@ -485,8 +505,7 @@ impl RadioRx for SoapyRxHalf {
     }
 
     fn get_hardware_time(&self) -> Result<u64, Error> {
-        u64::try_from(self.device.get_hardware_time(None)?)
-            .map_err(|_| Error::invalid_setting("Soapy hardware time is negative"))
+        device_ticks(&self.device)
     }
 
     fn rx_read(&mut self, buf: &mut [Complex32], timeout_us: i64) -> Result<RxReadResult, Error> {

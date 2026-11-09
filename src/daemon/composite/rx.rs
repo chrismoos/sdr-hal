@@ -177,7 +177,7 @@ impl RxFanout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::composite::{CompositeConfig, Direction, grid_block_samples};
+    use crate::daemon::composite::{CompositeConfig, Direction};
 
     const PLAN: CompositeConfig = CompositeConfig {
         device_rate_hz: 3_888_000,
@@ -425,7 +425,7 @@ mod tests {
         let high = fanout.add_slot(&plan_for(824_040_000), PLAN.device_rate_hz);
         assert_eq!(fanout.slots(), 2);
 
-        let block = grid_block_samples(PLAN.device_rate_hz).unwrap();
+        let block = PLAN.grid_block_samples().unwrap();
         let device = composite(block, 0.8, 0.3);
 
         // Two blocks, so the second is past the filter transient. Only one slot's
@@ -450,7 +450,7 @@ mod tests {
     fn a_retuned_slot_follows_its_new_carrier() {
         let mut fanout = RxFanout::new(PLAN.device_rate_hz, TICK_RATE).unwrap();
         let slot = fanout.add_slot(&plan_for(821_000_000), PLAN.device_rate_hz);
-        let block = grid_block_samples(PLAN.device_rate_hz).unwrap();
+        let block = PLAN.grid_block_samples().unwrap();
         let device = composite(block, 0.8, 0.3);
 
         for _ in 0..2 {
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(fanout.slots(), 2, "a rejoining client grew the fan-out");
 
         // The surviving peer still slices its own carrier.
-        let block = grid_block_samples(PLAN.device_rate_hz).unwrap();
+        let block = PLAN.grid_block_samples().unwrap();
         let device = composite(block, 0.8, 0.3);
         for _ in 0..3 {
             fanout.process(high, &device, 0);
@@ -504,7 +504,7 @@ mod tests {
     fn the_reported_tick_backs_out_the_slice_group_delay() {
         let mut fanout = RxFanout::new(PLAN.device_rate_hz, TICK_RATE).unwrap();
         let slot = fanout.add_slot(&plan_for(824_040_000), PLAN.device_rate_hz);
-        let block = grid_block_samples(PLAN.device_rate_hz).unwrap();
+        let block = PLAN.grid_block_samples().unwrap();
         let device = composite(block, 0.5, 0.5);
 
         let start_ticks = 1_000 * block as u64 * 8;

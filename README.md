@@ -258,7 +258,8 @@ Composite mode is enabled by a `composite` block in the listener file:
     "device_rate_hz": 9720000,
     "tx_center_hz": 864945000,
     "rx_center_hz": 819945000,
-    "tx_digital_backoff_db": -12.0
+    "tx_digital_backoff_db": -12.0,
+    "block_duration_ms": 2.0
   }
 }
 ```
@@ -268,7 +269,7 @@ Composite mode is enabled by a `composite` block in the listener file:
 | `device_rate_hz` | width of the shared stream |
 | `tx_center_hz`, `rx_center_hz` | device tuning, midway between the client carriers |
 | `tx_digital_backoff_db` | headroom per client. Use about -10 for three carriers |
-| `block_duration_ms` | how much of the stream the daemon mixes at once, default 2 ms. RX latency is about one block |
+| `block_duration_ms` | block duration in milliseconds, default 2. Fractional values are rounded to the nearest whole device sample. RX latency is about one block |
 | `tx_deadline_ms` | when a block is committed, default 5 ms |
 
 - **Fit:** each carrier's offset from center plus half its sample rate must be at most half of `device_rate_hz`.

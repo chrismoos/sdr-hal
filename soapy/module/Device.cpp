@@ -255,8 +255,9 @@ void Device::setAntenna(const int direction, const size_t channel, const std::st
     checkChannel(direction, channel);
     if (direction == SOAPY_SDR_TX)
     {
-        if (name != kDefaultAntenna)
-            throw std::invalid_argument("sdrhal: the TX port is set in the server's radio configuration");
+        if (name != kDefaultAntenna && !warnedTxPort_.exchange(true))
+            SoapySDR::log(SOAPY_SDR_WARNING,
+                          "sdrhal: the TX port is set in the server's radio configuration, ignoring it here");
         return;
     }
     check(sdrhal_set_rx_antenna(device_, name == kDefaultAntenna ? "" : name.c_str()),

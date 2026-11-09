@@ -120,6 +120,7 @@ private:
     bool serverTxGain(sdrhal_range &range) const;
     double txGainDb_ = 0.0;
     std::atomic<bool> warnedTxGain_{false};
+    std::atomic<bool> warnedTxPort_{false};
 };
 
 }  // namespace SdrHal

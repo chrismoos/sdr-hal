@@ -80,8 +80,8 @@ pub enum DeviceConfig {
     Uhd {
         /// Device selector passed to the driver. Use the selector syntax for that driver.
         device: String,
-        /// Requires timestamped TX and zero intentional LO offset. RF rounding is
-        /// corrected in software so hardware playback restarts do not reset its phase.
+        /// Requires timestamped TX. RF rounding and any TX LO offset are corrected in
+        /// software so hardware playback restarts do not reset their phase.
         #[serde(default = "default_true")]
         software_tx_frequency_correction: bool,
         /// Zero-based hardware channel index.
@@ -551,7 +551,10 @@ mod tests {
         for entry in std::fs::read_dir("config").unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if !name.starts_with("radio_") || !name.ends_with(".json") {
+            if !name.starts_with("radio_")
+                || !name.ends_with(".json")
+                || name.ends_with(".local.json")
+            {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();

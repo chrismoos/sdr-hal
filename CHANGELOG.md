@@ -1,4 +1,6 @@
 # HEAD
+- Improved bladeRF and Soapy compatibility with composite radiod and reduced streaming delays.
+- Added composite TX arrival and RX sample-age diagnostics.
 - Enable real-time priorities on radiod threads.
 - Reduced composite TX gaps when client packets queue behind a processing batch.
 - Composite radiod accepts fractional RX bandwidths and client clock requests.
