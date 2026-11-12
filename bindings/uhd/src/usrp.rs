@@ -668,7 +668,7 @@ impl Usrp {
         })
     }
 
-    pub fn set_rx_bandwidth(&mut self, bandwidth: f64, channel: usize) -> Result<(), Error> {
+    pub fn set_rx_bandwidth(&self, bandwidth: f64, channel: usize) -> Result<(), Error> {
         // SAFETY: Native handles and argument buffers remain live for this synchronous FFI call.
         check_status(unsafe { uhd_sys::uhd_usrp_set_rx_bandwidth(self.0, bandwidth, channel as _) })
     }

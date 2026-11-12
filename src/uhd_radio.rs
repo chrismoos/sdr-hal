@@ -12,6 +12,8 @@ use uhd::{
 
 use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
+const BANDWIDTH_READBACK_TOLERANCE_HZ: f64 = 1.0;
+
 mod tx_correction;
 use tx_correction::TxFrequencyCorrection;
 
@@ -143,6 +145,108 @@ impl crate::clock::ClockProbe for UhdClockProbe<'_> {
     }
 }
 
+fn finish_calibration<T>(
+    created: Result<T, Error>,
+    restore: impl FnOnce() -> Result<(), Error>,
+) -> Result<T, Error> {
+    match (created, restore()) {
+        (Ok(stream), Ok(())) => Ok(stream),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(restore)) => {
+            let message = format!("{primary}. RX bandwidth restoration also failed: {restore}");
+            Err(primary.context(message))
+        }
+    }
+}
+
+fn calibration_rx_bandwidth(receive: f64, master_clock: f64, maximum: f64) -> Option<f64> {
+    let temporary = master_clock.min(maximum);
+    (temporary > receive).then_some(temporary)
+}
+
+// B-series boards use the AD936x, whose TX quadrature calibration tones must pass the RX filter.
+fn tx_calibration_uses_rx_filter(motherboard: &str) -> bool {
+    motherboard.starts_with("B2")
+}
+
+trait CalibrationRxFilter {
+    fn bandwidth(&self) -> Result<f64, Error>;
+    fn maximum_bandwidth(&self) -> Result<f64, Error>;
+    fn set_bandwidth(&self, bandwidth_hz: f64) -> Result<(), Error>;
+}
+
+struct UsrpRxFilter<U> {
+    usrp: U,
+    channel: usize,
+}
+
+impl<U: std::ops::Deref<Target = Usrp>> CalibrationRxFilter for UsrpRxFilter<U> {
+    fn bandwidth(&self) -> Result<f64, Error> {
+        Ok(self.usrp.get_rx_bandwidth(self.channel)?)
+    }
+
+    fn maximum_bandwidth(&self) -> Result<f64, Error> {
+        Ok(self
+            .usrp
+            .get_rx_bandwidth_range(self.channel)
+            .and_then(|range| range.stop())?)
+    }
+
+    fn set_bandwidth(&self, bandwidth_hz: f64) -> Result<(), Error> {
+        Ok(self.usrp.set_rx_bandwidth(bandwidth_hz, self.channel)?)
+    }
+}
+
+/// Runs `calibrate`, which must trigger the AD936x TX quadrature calibration, with the RX
+/// filter widened, then restores and verifies the saved RX bandwidth even if `calibrate` fails.
+fn with_calibration_rx_filter<F: CalibrationRxFilter, T>(
+    filter: &mut F,
+    master_clock_hz: f64,
+    calibrate: impl FnOnce(&mut F) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let saved = filter
+        .bandwidth()
+        .map_err(|e| e.context("UHD: read RX bandwidth before TX calibration"))?;
+    let maximum = filter
+        .maximum_bandwidth()
+        .map_err(|e| e.context("UHD: read RX bandwidth limit for TX calibration"))?;
+    let Some(temporary) = calibration_rx_bandwidth(saved, master_clock_hz, maximum) else {
+        return calibrate(filter);
+    };
+    let calibrated = (|| {
+        filter
+            .set_bandwidth(temporary)
+            .map_err(|e| e.context("UHD: widen RX bandwidth for TX calibration"))?;
+        let applied = filter
+            .bandwidth()
+            .map_err(|e| e.context("UHD: read calibration RX bandwidth"))?;
+        if applied + BANDWIDTH_READBACK_TOLERANCE_HZ < temporary {
+            return Err(Error::invalid_setting(format!(
+                "UHD: calibration RX bandwidth requested={temporary} applied={applied}"
+            )));
+        }
+        info!(
+            "UHD: TX calibration RX bandwidth saved={saved} temporary={temporary} applied={applied}"
+        );
+        calibrate(filter)
+    })();
+    finish_calibration(calibrated, || {
+        filter
+            .set_bandwidth(saved)
+            .map_err(|e| e.context("UHD: restore RX bandwidth after TX calibration"))?;
+        let applied = filter
+            .bandwidth()
+            .map_err(|e| e.context("UHD: read restored RX bandwidth"))?;
+        if (applied - saved).abs() > BANDWIDTH_READBACK_TOLERANCE_HZ {
+            return Err(Error::invalid_setting(format!(
+                "UHD: restored RX bandwidth saved={saved} applied={applied}"
+            )));
+        }
+        info!("UHD: restored RX bandwidth after TX calibration: {applied}");
+        Ok(())
+    })
+}
+
 /// A USRP radio with TX and optional RX. Both streams use the device master clock for timestamps.
 /// Configure RX and clock sources before splitting. Native RX activation starts immediately.
 pub struct UhdRadio {
@@ -163,6 +267,7 @@ pub struct UhdRadio {
     tx_correction: TxFrequencyCorrection,
     tx_streamer: Option<TransmitStreamer<Complex32>>,
     rx_streamer: Option<ReceiveStreamer<Complex32>>,
+    tx_calibration_uses_rx_filter: bool,
     // Must drop after the streamers. SoapyUHD streamers crash if the device goes first.
     usrp: Usrp,
 }
@@ -249,6 +354,7 @@ impl UhdRadio {
             tx_correction: TxFrequencyCorrection::default(),
             tx_streamer: None,
             rx_streamer: None,
+            tx_calibration_uses_rx_filter: tx_calibration_uses_rx_filter(&mb_name),
         };
         match tx_sample_rate_hz {
             Some(rate) => {
@@ -556,19 +662,33 @@ impl Radio for UhdRadio {
         // The TX streamer is built here, not at open, because selecting the device clock
         // during rate negotiation retunes the converters and invalidates any streamer
         // that already exists.
-        let tx_streamer = match this.tx_streamer.take() {
-            Some(streamer) => streamer,
-            None => this
+        let calibrate_on_split = this.tx_streamer.is_none()
+            && this.rx_streamer.is_some()
+            && this.tx_calibration_uses_rx_filter;
+        let tx_args = StreamArgs::<Complex32>::builder()
+            .channels(vec![this.channel])
+            .build();
+        let mut filter = UsrpRxFilter {
+            usrp: &mut this.usrp,
+            channel: this.rx_channel,
+        };
+        let tx_streamer = this.tx_streamer.take();
+        let create_tx_streamer = |filter: &mut UsrpRxFilter<&mut Usrp>| match tx_streamer {
+            Some(streamer) => Ok(streamer),
+            None => filter
                 .usrp
-                .get_tx_stream(
-                    &StreamArgs::<Complex32>::builder()
-                        .channels(vec![this.channel])
-                        .build(),
-                )
-                .map_err(|e| {
-                    let context = format!("UHD: create TX stream: {e}");
-                    Error::from(e).context(context)
-                })?,
+                .get_tx_stream(&tx_args)
+                .map_err(|e| Error::from(e).context("UHD: create TX stream")),
+        };
+        // AD9361 TX enable calibrates through the RX filter before streaming.
+        let tx_streamer = if calibrate_on_split {
+            with_calibration_rx_filter(
+                &mut filter,
+                this.master_clock_rate as f64,
+                create_tx_streamer,
+            )?
+        } else {
+            create_tx_streamer(&mut filter)?
         };
         let usrp = Arc::new(SharedUsrp {
             usrp: this.usrp,
@@ -584,6 +704,9 @@ impl Radio for UhdRadio {
             channel: this.channel,
             tx_lo_offset_hz: this.tx_lo_offset_hz,
             tx_correction: this.tx_correction,
+            calibration_rx_channel: (this.rx_streamer.is_some()
+                && this.tx_calibration_uses_rx_filter)
+                .then_some(this.rx_channel),
         };
         let rx_channel = this.rx_channel;
         let rx = this.rx_streamer.map(|s| -> Box<dyn RadioRx> {
@@ -610,6 +733,7 @@ struct UhdTxHalf {
     channel: usize,
     tx_lo_offset_hz: f64,
     tx_correction: TxFrequencyCorrection,
+    calibration_rx_channel: Option<usize>,
 }
 
 struct UhdClockReader {
@@ -777,19 +901,33 @@ impl RadioTx for UhdTxHalf {
         let request = self
             .tx_correction
             .tune_request(frequency_hz, self.tx_lo_offset_hz)?;
-        let result = self
-            .usrp
-            .configure(|usrp| usrp.set_tx_frequency(&request, self.channel))
-            .map_err(|e| {
-                let context = format!("UHD: set TX freq: {}", e);
-                Error::from(e).context(context)
-            })?;
-        self.tx_correction.update_tune(
-            frequency_hz,
-            result.actual_rf_freq(),
-            result.actual_dsp_freq(),
-        )?;
-        Ok(())
+        let channel = self.channel;
+        let master_clock_hz = self.master_clock_rate as f64;
+        let calibration_rx_channel = self.calibration_rx_channel;
+        let correction = &mut self.tx_correction;
+        self.usrp.configure(|usrp| {
+            let mut tune = || {
+                let result = usrp.set_tx_frequency(&request, channel).map_err(|e| {
+                    let context = format!("UHD: set TX freq: {}", e);
+                    Error::from(e).context(context)
+                })?;
+                correction.update_tune(
+                    frequency_hz,
+                    result.actual_rf_freq(),
+                    result.actual_dsp_freq(),
+                )
+            };
+            // UHD recalibrates TX quadrature when a retune leaves its private calibration
+            // window, so any retune may need the wide RX filter.
+            match calibration_rx_channel {
+                Some(channel) => with_calibration_rx_filter(
+                    &mut UsrpRxFilter { usrp, channel },
+                    master_clock_hz,
+                    |_| tune(),
+                ),
+                None => tune(),
+            }
+        })
     }
 
     fn set_tx_gain(&mut self, gain_db: f64) -> Result<f64, Error> {
@@ -975,7 +1113,206 @@ impl RadioRx for UhdRxHalf {
 
 #[cfg(test)]
 mod tests {
-    use super::{TxRadioHealth, finish_tx_send, record_async_tx_event};
+    use super::{
+        CalibrationRxFilter, TxRadioHealth, calibration_rx_bandwidth, finish_calibration,
+        finish_tx_send, record_async_tx_event, tx_calibration_uses_rx_filter,
+        with_calibration_rx_filter,
+    };
+    use crate::error::{Error, ErrorKind};
+    use std::cell::RefCell;
+
+    const NARROW_HZ: f64 = 5e6;
+    const MASTER_CLOCK_HZ: f64 = 30.72e6;
+    const MAXIMUM_HZ: f64 = 56e6;
+
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Read(f64),
+        Maximum,
+        Set(f64),
+        Calibrate,
+    }
+
+    struct FakeRxFilter {
+        bandwidth: RefCell<f64>,
+        steps: RefCell<Vec<Step>>,
+        // A set to this bandwidth is accepted but applies `shortfall_hz` less.
+        short_set: Option<(f64, f64)>,
+        fail_set: Option<f64>,
+    }
+
+    impl FakeRxFilter {
+        fn new(bandwidth: f64) -> Self {
+            Self {
+                bandwidth: RefCell::new(bandwidth),
+                steps: RefCell::new(Vec::new()),
+                short_set: None,
+                fail_set: None,
+            }
+        }
+    }
+
+    impl CalibrationRxFilter for FakeRxFilter {
+        fn bandwidth(&self) -> Result<f64, Error> {
+            let bandwidth = *self.bandwidth.borrow();
+            self.steps.borrow_mut().push(Step::Read(bandwidth));
+            Ok(bandwidth)
+        }
+
+        fn maximum_bandwidth(&self) -> Result<f64, Error> {
+            self.steps.borrow_mut().push(Step::Maximum);
+            Ok(MAXIMUM_HZ)
+        }
+
+        fn set_bandwidth(&self, bandwidth_hz: f64) -> Result<(), Error> {
+            self.steps.borrow_mut().push(Step::Set(bandwidth_hz));
+            if self.fail_set == Some(bandwidth_hz) {
+                return Err(Error::new(ErrorKind::Backend, "set refused"));
+            }
+            let applied = match self.short_set {
+                Some((requested, shortfall_hz)) if requested == bandwidth_hz => {
+                    bandwidth_hz - shortfall_hz
+                }
+                _ => bandwidth_hz,
+            };
+            *self.bandwidth.borrow_mut() = applied;
+            Ok(())
+        }
+    }
+
+    fn calibrate(filter: &mut FakeRxFilter, outcome: Result<u8, Error>) -> Result<u8, Error> {
+        with_calibration_rx_filter(filter, MASTER_CLOCK_HZ, |filter| {
+            filter.steps.borrow_mut().push(Step::Calibrate);
+            outcome
+        })
+    }
+
+    #[test]
+    fn calibration_runs_inside_a_verified_widen_and_restore() {
+        let mut filter = FakeRxFilter::new(NARROW_HZ);
+        assert_eq!(calibrate(&mut filter, Ok(7)).unwrap(), 7);
+        assert_eq!(
+            *filter.steps.borrow(),
+            [
+                Step::Read(NARROW_HZ),
+                Step::Maximum,
+                Step::Set(MASTER_CLOCK_HZ),
+                Step::Read(MASTER_CLOCK_HZ),
+                Step::Calibrate,
+                Step::Set(NARROW_HZ),
+                Step::Read(NARROW_HZ),
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_receive_filter_calibrates_without_touching_it() {
+        let mut filter = FakeRxFilter::new(MAXIMUM_HZ);
+        assert_eq!(calibrate(&mut filter, Ok(7)).unwrap(), 7);
+        assert_eq!(
+            *filter.steps.borrow(),
+            [Step::Read(MAXIMUM_HZ), Step::Maximum, Step::Calibrate]
+        );
+    }
+
+    #[test]
+    fn failed_calibration_still_restores_and_keeps_its_error() {
+        let mut filter = FakeRxFilter::new(NARROW_HZ);
+        let error =
+            calibrate(&mut filter, Err(Error::new(ErrorKind::Timeout, "tune"))).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(*filter.bandwidth.borrow(), NARROW_HZ);
+        assert_eq!(filter.steps.borrow()[5], Step::Set(NARROW_HZ));
+    }
+
+    #[test]
+    fn short_widen_skips_calibration_and_restores() {
+        let mut filter = FakeRxFilter::new(NARROW_HZ);
+        filter.short_set = Some((MASTER_CLOCK_HZ, 2.0));
+        let error = calibrate(&mut filter, Ok(7)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidSetting);
+        assert!(!filter.steps.borrow().contains(&Step::Calibrate));
+        assert_eq!(*filter.bandwidth.borrow(), NARROW_HZ);
+    }
+
+    #[test]
+    fn refused_widen_skips_calibration_and_restores() {
+        let mut filter = FakeRxFilter::new(NARROW_HZ);
+        filter.fail_set = Some(MASTER_CLOCK_HZ);
+        let error = calibrate(&mut filter, Ok(7)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Backend);
+        assert!(!filter.steps.borrow().contains(&Step::Calibrate));
+        assert_eq!(filter.steps.borrow().last(), Some(&Step::Read(NARROW_HZ)));
+    }
+
+    #[test]
+    fn unverified_restore_fails_a_successful_calibration() {
+        let mut filter = FakeRxFilter::new(NARROW_HZ);
+        filter.short_set = Some((NARROW_HZ, 2.0));
+        let error = calibrate(&mut filter, Ok(7)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidSetting);
+        assert!(error.to_string().contains("restored RX bandwidth"));
+    }
+
+    #[test]
+    fn only_b_series_boards_widen_the_rx_filter_for_tx_calibration() {
+        for name in ["B200", "B210", "B200mini", "B205mini", "B200?"] {
+            assert!(tx_calibration_uses_rx_filter(name), "{name}");
+        }
+        for name in ["", "X310", "N310", "N210", "E310", "E320"] {
+            assert!(!tx_calibration_uses_rx_filter(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn calibration_filter_respects_device_limit_and_preserves_wider_receive_filter() {
+        assert_eq!(calibration_rx_bandwidth(5e6, 30.72e6, 56e6), Some(30.72e6));
+        assert_eq!(calibration_rx_bandwidth(5e6, 61.44e6, 56e6), Some(56e6));
+        assert_eq!(calibration_rx_bandwidth(40e6, 30.72e6, 56e6), None);
+        assert_eq!(calibration_rx_bandwidth(56e6, 61.44e6, 56e6), None);
+    }
+
+    #[test]
+    fn calibration_restores_on_success_and_failed_creation() {
+        for created in [Ok(7_u8), Err(Error::new(ErrorKind::Backend, "create"))] {
+            let expected = created.is_ok();
+            let mut restored = false;
+            let result = finish_calibration(created, || {
+                restored = true;
+                Ok(())
+            });
+            assert!(restored);
+            assert_eq!(result.is_ok(), expected);
+        }
+    }
+
+    #[test]
+    fn calibration_preserves_primary_kind_and_both_failure_contexts() {
+        let error = finish_calibration::<()>(
+            Err(Error::new(ErrorKind::Timeout, "create timed out")),
+            || Err(Error::new(ErrorKind::Disconnected, "restore disconnected")),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert!(error.to_string().contains("create timed out"));
+        assert!(error.to_string().contains("restore disconnected"));
+    }
+
+    #[test]
+    fn calibration_drops_created_stream_when_restoration_fails() {
+        struct Stream<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Stream<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = std::cell::Cell::new(false);
+        let result = finish_calibration(Ok(Stream(&dropped)), || {
+            Err(Error::new(ErrorKind::Backend, "restore"))
+        });
+        assert!(result.is_err());
+        assert!(dropped.get());
+    }
 
     #[test]
     fn complete_data_and_empty_stop_sends_commit_the_burst_flag() {

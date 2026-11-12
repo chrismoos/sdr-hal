@@ -1,4 +1,5 @@
 # HEAD
+- Fixed B200 TX calibration with narrow receive bandwidths, including TX retunes after `split()`.
 
 # v0.1.2
 - Fixed Soapy `stop()` failing with "Stream is not active" on a TX or RX stream that was never started.
