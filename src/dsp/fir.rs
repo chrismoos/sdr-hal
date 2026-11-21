@@ -359,6 +359,8 @@ impl ComplexFir32 {
 /// Block-only complex FIR interpolator with real taps.
 pub struct PolyphaseComplexFir32 {
     phase_taps: Vec<f32>,
+    #[cfg(target_arch = "x86_64")]
+    avx_phase_taps: Option<[[f32; 8]; 12]>,
     delay_re: Vec<f32>,
     delay_im: Vec<f32>,
     head: usize,
@@ -397,6 +399,15 @@ impl PolyphaseComplexFir32 {
         }
         let delay_size = delay_len * 2 + (row_len - delay_len);
         Self {
+            #[cfg(target_arch = "x86_64")]
+            avx_phase_taps: (interpolate == 4
+                && row_len == 12
+                && std::arch::is_x86_feature_detected!("avx"))
+            .then(|| {
+                std::array::from_fn(|tap| {
+                    std::array::from_fn(|lane| phase_taps[(lane % 4) * row_len + tap])
+                })
+            }),
             phase_taps,
             delay_re: vec![0.0; delay_size],
             delay_im: vec![0.0; delay_size],
@@ -421,6 +432,12 @@ impl PolyphaseComplexFir32 {
         out.clear();
         out.reserve(input.len() * self.interpolate);
         let gain = self.interpolate as f32;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(taps) = self.avx_phase_taps {
+            // SAFETY: The constructor initializes the transposed taps only when AVX is available.
+            unsafe { self.process_avx_4x(input, out, &taps) };
+            return;
+        }
         for &sample in input {
             self.push_sample(sample);
             for phase in 0..self.interpolate {
@@ -432,6 +449,26 @@ impl PolyphaseComplexFir32 {
                 );
                 out.push(Complex32::new(re * gain, im * gain));
             }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    unsafe fn process_avx_4x(
+        &mut self,
+        input: &[Complex32],
+        out: &mut Vec<Complex32>,
+        taps: &[[f32; 8]; 12],
+    ) {
+        for &sample in input {
+            self.push_sample(sample);
+            let re = self.delay_re[self.head..]
+                .first_chunk()
+                .expect("12-sample delay");
+            let im = self.delay_im[self.head..]
+                .first_chunk()
+                .expect("12-sample delay");
+            out.extend(kernels::polyphase_avx_4x(taps, re, im));
         }
     }
 
@@ -531,7 +568,27 @@ impl SymmetricComplexFir32 {
 
         self.stage_block(input);
         let half = self.half_taps.len();
-        for oldest in 0..input.len() {
+        #[cfg(not(target_arch = "x86_64"))]
+        let processed = 0;
+        #[cfg(target_arch = "x86_64")]
+        let mut processed = 0;
+        #[cfg(target_arch = "x86_64")]
+        if self.center_tap.is_none()
+            && half.is_multiple_of(kernels::SSE_LANES)
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: AVX2 support was checked above.
+            processed = unsafe {
+                kernels::symmetric_complex_block_x86(
+                    &self.half_taps,
+                    &self.block_re,
+                    &self.block_im,
+                    input.len(),
+                    out,
+                )
+            };
+        }
+        for oldest in processed..input.len() {
             let mut value = symmetric_complex_accumulate(
                 &self.half_taps,
                 &self.block_re,

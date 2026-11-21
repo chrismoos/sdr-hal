@@ -40,7 +40,7 @@ fn symmetric_block_path_matches_per_sample_path_exactly() {
         .collect();
 
     for taps in [even, odd] {
-        for split in [1usize, 7, 47, 48, 64, 250] {
+        for split in [1usize, 7, 8, 9, 17, 47, 48, 64, 250] {
             let mut per_sample = SymmetricComplexFir32::new(&taps);
             let expected: Vec<Complex32> = samples
                 .iter()
@@ -130,11 +130,11 @@ fn polyphase_complex_fir_matches_general_complex_fir() {
         let mut reference = ComplexFir32::with_interpolate(&taps, interpolate);
         let mut fast = PolyphaseComplexFir32::with_interpolate(&taps, interpolate);
 
-        let (first, second) = input.split_at(400);
-        let mut want = reference.process_block(first);
-        want.extend(reference.process_block(second));
-        let mut got = fast.process_block(first);
-        got.extend(fast.process_block(second));
+        let want = reference.process_block(&input);
+        let mut got = Vec::new();
+        for chunk in input.chunks(17) {
+            got.extend(fast.process_block(chunk));
+        }
 
         assert_eq!(got.len(), want.len());
         for (idx, (got, want)) in got.iter().zip(&want).enumerate() {

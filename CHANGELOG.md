@@ -1,4 +1,6 @@
 # HEAD
+- Reduced bladeRF transmit CPU load when using a TX LO offset.
+- Reduced CPU load for composite mixing and 4× FIR filtering.
 
 # v0.1.3
 - Fixed B200 TX calibration with narrow receive bandwidths, including TX retunes after `split()`.

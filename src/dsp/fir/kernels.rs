@@ -261,3 +261,108 @@ unsafe fn dot_re_im_sse(taps: &[f32], re: &[f32], im: &[f32]) -> (f32, f32) {
     }
     (sum_re, sum_im)
 }
+
+#[cfg(target_arch = "x86_64")]
+pub(super) const SSE_LANES: usize = 4;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn symmetric_complex_block_x86(
+    taps: &[f32],
+    re: &[f32],
+    im: &[f32],
+    samples: usize,
+    out: &mut Vec<Complex32>,
+) -> usize {
+    const AVX_LANES: usize = 8;
+    let processed = samples / AVX_LANES * AVX_LANES;
+    let history = taps.len() * 2 - 1;
+    for start in (0..processed).step_by(AVX_LANES) {
+        let end = start + AVX_LANES + history;
+        let re = &re[start..end];
+        let im = &im[start..end];
+        // SAFETY: The checked slices include eight output windows.
+        let (re, im) = unsafe { (symmetric_avx2(taps, re), symmetric_avx2(taps, im)) };
+        out.extend(
+            re.into_iter()
+                .zip(im)
+                .map(|(re, im)| Complex32::new(re, im)),
+        );
+    }
+    processed
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn symmetric_avx2(taps: &[f32], samples: &[f32]) -> [f32; 8] {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps,
+    };
+
+    let mut sums = [_mm256_setzero_ps(); SSE_LANES];
+    let last = taps.len() * 2 - 1;
+    for (chunk, coefficients) in taps.chunks_exact(SSE_LANES).enumerate() {
+        for (lane, &coefficient) in coefficients.iter().enumerate() {
+            let tap = chunk * SSE_LANES + lane;
+            // SAFETY: Each load spans eight outputs inside the checked input window.
+            let (front, back) = unsafe {
+                (
+                    _mm256_loadu_ps(samples.as_ptr().add(tap)),
+                    _mm256_loadu_ps(samples.as_ptr().add(last - tap)),
+                )
+            };
+            let pair = _mm256_add_ps(front, back);
+            sums[lane] =
+                _mm256_add_ps(sums[lane], _mm256_mul_ps(_mm256_set1_ps(coefficient), pair));
+        }
+    }
+    // The SSE reduction order keeps block and single-sample results bit-identical.
+    let sum = _mm256_add_ps(
+        _mm256_add_ps(sums[0], sums[2]),
+        _mm256_add_ps(sums[1], sums[3]),
+    );
+    let mut result = [0.0; 8];
+    // SAFETY: The destination holds all eight lanes.
+    unsafe { _mm256_storeu_ps(result.as_mut_ptr(), sum) };
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[inline]
+pub(super) fn polyphase_avx_4x(
+    taps: &[[f32; 8]; 12],
+    re: &[f32; 12],
+    im: &[f32; 12],
+) -> [Complex32; 4] {
+    use std::arch::x86_64::{
+        _mm_set1_ps, _mm256_add_ps, _mm256_castps128_ps256, _mm256_insertf128_ps, _mm256_loadu_ps,
+        _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    let mut sums = [_mm256_setzero_ps(); SSE_LANES];
+    for (chunk, coefficients) in taps.chunks_exact(SSE_LANES).enumerate() {
+        for (lane, coeff) in coefficients.iter().enumerate() {
+            let tap = chunk * SSE_LANES + lane;
+            let iq = _mm256_insertf128_ps::<1>(
+                _mm256_castps128_ps256(_mm_set1_ps(re[tap])),
+                _mm_set1_ps(im[tap]),
+            );
+            // SAFETY: Each coefficient row holds all eight lanes.
+            let coeff = unsafe { _mm256_loadu_ps(coeff.as_ptr()) };
+            sums[lane] = _mm256_add_ps(sums[lane], _mm256_mul_ps(iq, coeff));
+        }
+    }
+    // Match the SSE reduction order for each phase.
+    let sum = _mm256_add_ps(
+        _mm256_add_ps(sums[0], sums[2]),
+        _mm256_add_ps(sums[1], sums[3]),
+    );
+    let scaled = _mm256_mul_ps(sum, std::arch::x86_64::_mm256_set1_ps(4.0));
+    let mut iq = [0.0; 8];
+    // SAFETY: The destination holds all eight lanes.
+    unsafe { _mm256_storeu_ps(iq.as_mut_ptr(), scaled) };
+    std::array::from_fn(|phase| Complex32::new(iq[phase], iq[phase + SSE_LANES]))
+}

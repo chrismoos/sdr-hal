@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::dsp::PhasorNco;
 use crate::error::{Error, ErrorKind};
 use bladerf::device::{rx_channel, tx_channel};
 use bladerf::format::SC16_Q11_META;
@@ -60,7 +61,6 @@ pub struct BladeRfRadio {
     sample_rate: u32,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
-    tx_nco_phase_rad: f64,
     rx_configured: bool,
     num_buffers: u32,
     buffer_size: u32,
@@ -186,7 +186,6 @@ impl BladeRfRadio {
             sample_rate: actual_rate,
             tx_lo_offset_hz: 0.0,
             tx_sample_rate_hz: actual_rate as f64,
-            tx_nco_phase_rad: 0.0,
             rx_configured: false,
             num_buffers: nb,
             buffer_size: bs,
@@ -199,30 +198,7 @@ impl BladeRfRadio {
     /// Retune the center frequency after changing the offset to apply it to the LO.
     pub fn set_tx_lo_offset(&mut self, offset_hz: i64) -> Result<(), Error> {
         self.tx_lo_offset_hz = offset_hz as f64;
-        self.tx_nco_phase_rad = 0.0;
         Ok(())
-    }
-
-    fn apply_tx_lo_offset(
-        tx_lo_offset_hz: f64,
-        tx_sample_rate_hz: f64,
-        tx_nco_phase_rad: &mut f64,
-        samples: &mut [Complex32],
-    ) {
-        if tx_lo_offset_hz == 0.0 || tx_sample_rate_hz <= 0.0 {
-            return;
-        }
-
-        let phase_step = -2.0 * std::f64::consts::PI * tx_lo_offset_hz / tx_sample_rate_hz;
-        let mut phase = *tx_nco_phase_rad;
-
-        for sample in samples.iter_mut() {
-            let rot = Complex32::new(phase.cos() as f32, phase.sin() as f32);
-            *sample *= rot;
-            phase += phase_step;
-        }
-
-        *tx_nco_phase_rad = phase.rem_euclid(2.0 * std::f64::consts::PI);
     }
 }
 
@@ -291,7 +267,6 @@ impl Radio for BladeRfRadio {
             })?;
         self.sample_rate = actual;
         self.tx_sample_rate_hz = actual as f64;
-        self.tx_nco_phase_rad = 0.0;
         Ok(actual as f64)
     }
 
@@ -438,7 +413,7 @@ impl Radio for BladeRfRadio {
             sample_rate: self.sample_rate,
             tx_lo_offset_hz: self.tx_lo_offset_hz,
             tx_sample_rate_hz: self.tx_sample_rate_hz,
-            tx_nco_phase_rad: self.tx_nco_phase_rad,
+            tx_lo_rotator: tx_lo_rotator(self.tx_lo_offset_hz, self.tx_sample_rate_hz),
             shared_clock: shared_clock.clone(),
             stream_timeout_ms: self.stream_timeout_ms,
             module_enabled: true,
@@ -479,7 +454,7 @@ struct BladeRfTxHalf {
     sample_rate: u32,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
-    tx_nco_phase_rad: f64,
+    tx_lo_rotator: PhasorNco,
     shared_clock: Arc<AtomicU64>,
     stream_timeout_ms: u32,
     module_enabled: bool,
@@ -586,7 +561,7 @@ impl RadioTx for BladeRfTxHalf {
                 self.module_enabled = true;
             }
             if !self.burst_active {
-                self.tx_nco_phase_rad = 0.0;
+                self.tx_lo_rotator = tx_lo_rotator(self.tx_lo_offset_hz, self.tx_sample_rate_hz);
             }
         } else if self.burst_active {
             // Ending a burst must not disable the TX channel, which destroys the stream.
@@ -822,6 +797,15 @@ impl Drop for BladeRfRxHalf {
     }
 }
 
+fn tx_lo_rotator(offset_hz: f64, sample_rate_hz: f64) -> PhasorNco {
+    let phase_step = if sample_rate_hz > 0.0 {
+        -std::f64::consts::TAU * offset_hz / sample_rate_hz
+    } else {
+        0.0
+    };
+    PhasorNco::new(phase_step)
+}
+
 impl BladeRfTxHalf {
     fn write_chunk(
         &mut self,
@@ -829,17 +813,16 @@ impl BladeRfTxHalf {
         tick: Option<u64>,
         end_of_burst: bool,
     ) -> Result<(), Error> {
-        self.tx_scratch.clear();
-        self.tx_scratch.extend_from_slice(samples);
-        BladeRfRadio::apply_tx_lo_offset(
-            self.tx_lo_offset_hz,
-            self.tx_sample_rate_hz,
-            &mut self.tx_nco_phase_rad,
-            &mut self.tx_scratch,
-        );
+        let samples = if self.tx_lo_rotator.is_active() {
+            self.tx_lo_rotator
+                .rotate_into(samples, &mut self.tx_scratch);
+            self.tx_scratch.as_slice()
+        } else {
+            samples
+        };
         self.sc16_scratch.clear();
         self.sc16_scratch
-            .extend(self.tx_scratch.iter().map(|s| Sc16Q11::from_complex32(*s)));
+            .extend(samples.iter().copied().map(Sc16Q11::from_complex32));
 
         match tick {
             Some(ts) => {

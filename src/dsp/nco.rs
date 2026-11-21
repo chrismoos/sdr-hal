@@ -144,9 +144,55 @@ impl PhasorNco {
         assert_eq!(left.len(), right.len());
         out.clear();
         out.reserve(left.len());
-        out.extend(left.iter().zip(right).map(|(&left_sample, &right_sample)| {
-            (self.mix(left_sample) + right_nco.mix(right_sample) * right_gain) * output_scale
-        }));
+        let mut index = 0;
+        if self.active
+            && right_nco.active
+            && self.samples_since_resync == right_nco.samples_since_resync
+        {
+            while index < left.len()
+                && !(self.samples_since_resync as usize).is_multiple_of(ROTOR_LANES)
+            {
+                out.push(
+                    (self.mix(left[index]) + right_nco.mix(right[index]) * right_gain)
+                        * output_scale,
+                );
+                index += 1;
+            }
+
+            while left.len() - index >= ROTOR_LANES {
+                let epoch_groups =
+                    (PHASOR_NCO_RESYNC_SAMPLES - self.samples_since_resync) as usize / ROTOR_LANES;
+                let groups = ((left.len() - index) / ROTOR_LANES).min(epoch_groups);
+                let batch_samples = groups * ROTOR_LANES;
+                for (left_group, right_group) in left[index..index + batch_samples]
+                    .chunks_exact(ROTOR_LANES)
+                    .zip(right[index..index + batch_samples].chunks_exact(ROTOR_LANES))
+                {
+                    for lane in 0..ROTOR_LANES {
+                        out.push(
+                            (left_group[lane] * self.lanes[lane]
+                                + right_group[lane] * right_nco.lanes[lane] * right_gain)
+                                * output_scale,
+                        );
+                        self.lanes[lane] *= self.lane_step;
+                        right_nco.lanes[lane] *= right_nco.lane_step;
+                    }
+                }
+                index += batch_samples;
+                self.samples_since_resync += batch_samples as u32;
+                right_nco.samples_since_resync += batch_samples as u32;
+                if self.samples_since_resync == PHASOR_NCO_RESYNC_SAMPLES {
+                    self.resync();
+                    right_nco.resync();
+                }
+            }
+        }
+
+        out.extend(left[index..].iter().zip(&right[index..]).map(
+            |(&left_sample, &right_sample)| {
+                (self.mix(left_sample) + right_nco.mix(right_sample) * right_gain) * output_scale
+            },
+        ));
     }
 
     /// A rotor does not depend on how the input is split across calls.
