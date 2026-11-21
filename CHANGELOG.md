@@ -1,4 +1,6 @@
 # HEAD
+
+# v0.1.4
 - Reduced bladeRF transmit CPU load when using a TX LO offset.
 - Reduced CPU load for composite mixing and 4× FIR filtering.
 
