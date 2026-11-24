@@ -27,11 +27,6 @@ const RECV_BUF_LEN: usize = 65536;
 const RECEIVER_POLL: Duration = Duration::from_millis(250);
 const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TX_BLOCK_SAMPLES: usize = 32_768;
-// Pace UDP writes to avoid socket overflow.
-const TX_PACING_NUM: u32 = 21;
-const TX_PACING_DEN: u32 = 20;
-const TX_PACING_SLACK: Duration = Duration::from_micros(500);
-const TX_PACING_IDLE: Duration = Duration::from_millis(50);
 
 /// Remote IQ packet and transport options. Defaults to 350 samples per packet, UDP, and the control host.
 #[derive(Debug, Clone)]
@@ -522,7 +517,6 @@ impl Radio for NetworkRadio {
                 rx_reference_dbm: self.rx_reference_dbm(),
             },
             scratch: Vec::new(),
-            pace_next: Instant::now(),
             tx_stream,
             shutdown,
         };
@@ -782,7 +776,6 @@ struct NetworkRadioTx {
     active: bool,
     calibration: crate::RadioCalibration,
     scratch: Vec<u8>,
-    pace_next: Instant,
     tx_stream: Option<std::net::TcpStream>,
     shutdown: Arc<AtomicBool>,
 }
@@ -819,23 +812,6 @@ impl NetworkRadioTx {
             sent += block.len();
         }
         Ok(())
-    }
-
-    fn pace(&mut self, samples: usize) {
-        let now = Instant::now();
-        if self.pace_next + TX_PACING_IDLE < now {
-            self.pace_next = now;
-        }
-        if let Some(ahead) = self.pace_next.checked_duration_since(now)
-            && ahead > TX_PACING_SLACK
-        {
-            std::thread::sleep(ahead);
-        }
-        let airtime = Duration::from_nanos(crate::network::wire::samples_to_ns_exact(
-            samples as u64,
-            self.tx_sample_rate_hz,
-        ));
-        self.pace_next += airtime * TX_PACING_DEN / TX_PACING_NUM;
     }
 
     fn send_block(
@@ -895,7 +871,6 @@ impl NetworkRadioTx {
                     stream.write_all(&self.scratch)?;
                 }
                 None => {
-                    self.pace(chunk.len());
                     self.socket.send(&self.scratch)?;
                 }
             }

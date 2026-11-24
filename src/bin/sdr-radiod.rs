@@ -1,28 +1,48 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use log::info;
 use sdr_hal::config::{DeviceConfig, RadioConfig};
 use sdr_hal::daemon::config::DEFAULT_CONFIG_PATH;
 use sdr_hal::daemon::{RadiodConfig, RxDefaults, serve};
 
+#[path = "sdr-radiod/plan.rs"]
+mod plan;
+
 #[derive(Parser)]
-#[command(about = "SDR radio server: serves a local SDR over the network")]
+#[command(
+    about = "SDR radio server: serves a local SDR over the network",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
     config: PathBuf,
 
     #[arg(
         long,
         visible_alias = "radio",
+        required = true,
         help = "Hardware radio JSON configuration"
     )]
-    radio_config: PathBuf,
+    radio_config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Choose a composite configuration for a set of clients, or check an existing one
+    Plan(plan::PlanArgs),
 }
 
 fn main() -> Result<(), sdr_hal::error::Error> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    if let Some(Command::Plan(plan_args)) = args.command {
+        std::process::exit(plan::run(plan_args));
+    }
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config = RadiodConfig::load_from_path(&args.config)?;
     sdr_hal::daemon::realtime::configure(config.realtime);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -34,7 +54,10 @@ fn main() -> Result<(), sdr_hal::error::Error> {
 }
 
 async fn run(args: Args, config: RadiodConfig) -> Result<(), sdr_hal::error::Error> {
-    let mut radio_config = RadioConfig::load(&args.radio_config)?;
+    let radio_path = args
+        .radio_config
+        .ok_or("--radio-config is required to serve a radio")?;
+    let mut radio_config = RadioConfig::load(&radio_path)?;
     if matches!(radio_config.device, DeviceConfig::Network { .. }) {
         return Err("radiod requires a local radio backend, not another network radio".into());
     }
@@ -118,13 +141,13 @@ mod tests {
         let args = Args::try_parse_from([
             "sdr-radiod",
             "--radio-config",
-            "config/radio_soapy_plutosdr.json",
+            "config/radio_soapy_plutosky.json",
         ])
         .unwrap();
         assert_eq!(args.config, PathBuf::from(DEFAULT_CONFIG_PATH));
         assert_eq!(
             args.radio_config,
-            PathBuf::from("config/radio_soapy_plutosdr.json")
+            Some(PathBuf::from("config/radio_soapy_plutosky.json"))
         );
         let args = Args::try_parse_from([
             "sdr-radiod",
@@ -135,8 +158,22 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.config, PathBuf::from("custom.json"));
-        assert_eq!(args.radio_config, PathBuf::from("hardware.json"));
+        assert_eq!(args.radio_config, Some(PathBuf::from("hardware.json")));
         assert!(Args::try_parse_from(["sdr-radiod"]).is_err());
+    }
+
+    #[test]
+    fn plan_needs_no_radio_config() {
+        let args = Args::try_parse_from([
+            "sdr-radiod",
+            "plan",
+            "--client",
+            "tx=881.52M,rx=836.52M,rate=4.9152M",
+            "--max-device-rate",
+            "30.72M",
+        ])
+        .unwrap();
+        assert!(matches!(args.command, Some(Command::Plan(_))));
     }
 
     #[test]

@@ -199,6 +199,9 @@ impl RadioRx for DeviceRx {
         Ok(self.clock.now_ticks())
     }
     fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), Error> {
+        if self.active.load(Ordering::SeqCst) {
+            return Err("Stream is already active".into());
+        }
         self.next_sample = self.clock.now_ticks() / (TICK_RATE / DEVICE_RATE_HZ);
         self.state.lock().rx_activated = true;
         self.active.store(true, Ordering::SeqCst);
@@ -752,6 +755,35 @@ fn a_receive_only_udp_client_that_dies_releases_its_slice() {
         "rejoining client reads {level} rather than 0.3"
     );
     drop(keeper_tx);
+}
+
+#[test]
+fn a_client_replacing_one_that_died_mid_receive_shares_the_running_receiver() {
+    let state = Arc::new(Mutex::new(DeviceState::default()));
+    let (_server, control) = start_server(state.clone());
+
+    let drain = |rx: &mut Box<dyn RadioRx>| -> usize {
+        let mut collected = 0;
+        let mut buf = vec![Complex32::default(); 4_096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while collected < 8_192 && Instant::now() < deadline {
+            collected += rx.rx_read(&mut buf, 200_000).expect("rx read").samples_read;
+        }
+        collected
+    };
+
+    for transport in [Transport::Udp, Transport::Tcp] {
+        let (_tx, rx) = open_client_over(control, LOW_TX_HZ, LOW_RX_HZ, true, transport);
+        let mut rx = rx.expect("rx half");
+        rx.rx_activate(None)
+            .unwrap_or_else(|e| panic!("{transport:?} activate after a client died: {e}"));
+        assert!(drain(&mut rx) >= 8_192, "{transport:?} client got nothing");
+        drop(rx);
+        // Dropped without stopping, which leaves the device receiver running. The
+        // next client must arrive after the daemon has released this one.
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert_eq!(state.lock().rx_stops, 0);
 }
 
 #[test]

@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 mod clients;
 mod grid;
+pub mod planner;
 mod resample;
 mod rx;
 mod slice;
@@ -56,7 +57,7 @@ pub(crate) const MAX_GRID_BLOCK_SAMPLES: usize = 1 << 20;
 /// `device_rate_hz` is the width of the shared stream, not a rate any client has to use.
 /// The analog filter bandwidths come from the radio configuration, as they do for any
 /// other device-level setting.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositeConfig {
     /// Shared device sample rate in Hz, which sets the span carriers must fit inside.
@@ -91,6 +92,13 @@ impl Direction {
         match self {
             Self::Tx => "TX",
             Self::Rx => "RX",
+        }
+    }
+
+    fn article(self) -> &'static str {
+        match self {
+            Self::Tx => "a",
+            Self::Rx => "an",
         }
     }
 }

@@ -240,12 +240,6 @@ pub(crate) fn samples_to_ticks(samples: u64, tick_rate: u64, sample_rate_hz: f64
     (samples as f64 * tick_rate as f64 / sample_rate_hz).floor() as u64
 }
 
-/// Converts a sample count to wall-clock nanoseconds, for pacing rather than device time.
-#[cfg(feature = "network-backend")]
-pub(crate) fn samples_to_ns_exact(samples: u64, rate_hz: f64) -> u64 {
-    (samples as f64 * 1_000_000_000.0 / rate_hz).floor() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

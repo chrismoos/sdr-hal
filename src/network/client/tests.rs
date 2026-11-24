@@ -157,7 +157,6 @@ fn end_burst_preserves_stream_and_next_scheduled_block() {
         active: true,
         calibration: Default::default(),
         scratch: Vec::new(),
-        pace_next: Instant::now(),
         tx_stream: None,
         shutdown: Arc::new(AtomicBool::new(false)),
     };

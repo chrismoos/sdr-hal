@@ -1482,6 +1482,8 @@ pub async fn serve(
         }
     });
     let control_result = tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
         .add_service(RadioControlServiceServer::new(RadioControlSvc {
             shared: shared.clone(),
         }))
@@ -1497,6 +1499,9 @@ pub async fn serve(
 }
 
 const DATA_SOCKET_RECEIVE_BYTES: usize = 8 * 1024 * 1024;
+// Releases the session of a client whose host vanished without closing the connection.
+const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn set_receive_buffer(socket: &UdpSocket, bytes: usize) {
     let socket = socket2::SockRef::from(socket);

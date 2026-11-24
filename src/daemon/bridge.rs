@@ -2044,7 +2044,12 @@ impl RxBridge {
                 false
             }
             RxCommand::Activate { time_ticks, reply } => {
-                let result = rx.rx_activate(time_ticks);
+                // The device refuses a second activate of a running composite receiver.
+                let result = if *active && self.fanout.is_some() {
+                    Ok(())
+                } else {
+                    rx.rx_activate(time_ticks)
+                };
                 if result.is_ok() {
                     *active = true;
                 }

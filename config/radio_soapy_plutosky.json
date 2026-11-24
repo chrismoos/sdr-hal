@@ -1,6 +1,6 @@
 {
   "kind": "soapy",
-  "device": "driver=plutosdr",
+  "device": "driver=plutosky",
   "channel": 0,
   "antenna": "A",
   "tx_gain_db": 65.0,
