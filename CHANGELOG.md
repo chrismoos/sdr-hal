@@ -1,4 +1,6 @@
 # HEAD
+
+# v0.1.5
 - Replaced the PlutoSDR example radio file with `config/radio_soapy_plutosky.json`, and added a two-carrier 1x composite example.
 - Added `sdr-radiod plan` for help generating and validating composite configuration.
 - radiod reliability fixes (releases clients whose host stops answering, composite RX reconnect, network radio UDP transmit no longer blocks the caller).
