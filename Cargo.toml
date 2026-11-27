@@ -66,6 +66,9 @@ env_logger = { version = "0.11", optional = true }
 [build-dependencies]
 tonic-build = { version = "0.13", optional = true }
 
+[dev-dependencies]
+parking_lot = "0.12"
+
 [[bin]]
 name = "sdr-radiod"
 path = "src/bin/sdr-radiod.rs"
