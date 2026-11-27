@@ -1,4 +1,6 @@
 # HEAD
+
+# v0.2.0
 - Added GPS time for UHD radios: `"gps": "gpsdo"` for a radio with a GPSDO, and `"pps"` for software GPS disciplining of a free-running oscillator from its PPS.
 - Fixed radiod composite mode failing to start on a device with a slow clock query.
 - Added an API for the device clock's time reference (`time_reference()`), shared by every radiod client and available through the network client.

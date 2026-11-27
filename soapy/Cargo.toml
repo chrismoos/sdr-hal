@@ -13,13 +13,13 @@ name = "sdr_hal_soapy"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-sdr-hal = { path = "..", version = "0.1.0", features = ["network-backend"] }
+sdr-hal = { path = "..", version = "0.2.0", features = ["network-backend"] }
 num-complex = "0.4"
 log = "0.4"
 parking_lot = "0.12"
 
 [dev-dependencies]
-sdr-hal = { path = "..", version = "0.1.0", features = ["network-backend", "daemon"] }
+sdr-hal = { path = "..", version = "0.2.0", features = ["network-backend", "daemon"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]
