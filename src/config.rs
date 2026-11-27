@@ -43,8 +43,10 @@ fn default_true() -> bool {
 /// Calibration describes power and timing. It does not change hardware settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum DeviceConfig {
     /// `file_output`: stereo IQ WAV. Requires `file` when constructed.
+    #[non_exhaustive]
     FileOutput {
         /// Output filename. Construction creates or truncates the file.
         path: String,
@@ -52,6 +54,7 @@ pub enum DeviceConfig {
     /// `noop`: paced TX sink and optional silent RX.
     Noop {},
     /// `soapy`: SoapySDR device arguments. Requires `soapy-backend`.
+    #[non_exhaustive]
     Soapy {
         /// Device selector passed to the driver. Use the selector syntax for that driver.
         device: String,
@@ -77,6 +80,7 @@ pub enum DeviceConfig {
         rx_to_tx_delay_ns: Option<i64>,
     },
     /// `uhd`: USRP device arguments. Requires `uhd-backend`.
+    #[non_exhaustive]
     Uhd {
         /// Device selector passed to the driver. Use the selector syntax for that driver.
         device: String,
@@ -136,6 +140,7 @@ pub enum DeviceConfig {
         rx_to_tx_delay_ns: Option<i64>,
     },
     /// `lime`: LimeSuite device selection. Requires `lime-backend`.
+    #[non_exhaustive]
     Lime {
         /// Device selector passed to the driver. Use the selector syntax for that driver.
         device: String,
@@ -177,6 +182,7 @@ pub enum DeviceConfig {
         stream_throughput_vs_latency: Option<f32>,
     },
     /// `blade_rf`: libbladeRF device selection. Requires `bladerf-backend`.
+    #[non_exhaustive]
     BladeRf {
         /// Device selector passed to the driver. Use the selector syntax for that driver.
         #[serde(default)]
@@ -223,6 +229,7 @@ pub enum DeviceConfig {
         stream_timeout_ms: Option<u32>,
     },
     /// `network`: remote control endpoint. Requires `network-backend`.
+    #[non_exhaustive]
     Network {
         /// Control endpoint as `host:port`, without a URI scheme.
         addr: String,
@@ -259,6 +266,60 @@ pub enum DeviceConfig {
 impl Default for DeviceConfig {
     fn default() -> Self {
         Self::Noop {}
+    }
+}
+
+impl DeviceConfig {
+    /// A `file_output` config with every optional field at its default.
+    pub fn file_output(path: impl Into<String>) -> Self {
+        Self::with_defaults(serde_json::json!({ "kind": "file_output", "path": path.into() }))
+    }
+
+    /// A `soapy` config with every optional field at its default.
+    pub fn soapy(device: impl Into<String>, channel: usize, antenna: impl Into<String>) -> Self {
+        Self::with_defaults(serde_json::json!({
+            "kind": "soapy",
+            "device": device.into(),
+            "channel": channel,
+            "antenna": antenna.into(),
+        }))
+    }
+
+    /// A `uhd` config with every optional field at its default.
+    pub fn uhd(device: impl Into<String>, channel: usize, antenna: impl Into<String>) -> Self {
+        Self::with_defaults(serde_json::json!({
+            "kind": "uhd",
+            "device": device.into(),
+            "channel": channel,
+            "antenna": antenna.into(),
+        }))
+    }
+
+    /// A `lime` config with every optional field at its default.
+    pub fn lime(device: impl Into<String>, channel: usize) -> Self {
+        Self::with_defaults(serde_json::json!({
+            "kind": "lime",
+            "device": device.into(),
+            "channel": channel,
+        }))
+    }
+
+    /// A `blade_rf` config with every optional field at its default.
+    pub fn blade_rf(device: impl Into<String>, channel: u32) -> Self {
+        Self::with_defaults(serde_json::json!({
+            "kind": "blade_rf",
+            "device": device.into(),
+            "channel": channel,
+        }))
+    }
+
+    /// A `network` config with every optional field at its default.
+    pub fn network(addr: impl Into<String>) -> Self {
+        Self::with_defaults(serde_json::json!({ "kind": "network", "addr": addr.into() }))
+    }
+
+    fn with_defaults(required: serde_json::Value) -> Self {
+        serde_json::from_value(required).expect("every required field of the variant is set")
     }
 }
 
@@ -845,5 +906,60 @@ mod tests {
         }
         value["gps"] = serde_json::json!(true);
         assert!(serde_json::from_value::<DeviceConfig>(value).is_err());
+    }
+
+    #[test]
+    fn each_constructor_matches_a_config_with_only_its_required_fields() {
+        let cases = [
+            (
+                DeviceConfig::file_output("tx.wav"),
+                serde_json::json!({"kind": "file_output", "path": "tx.wav"}),
+            ),
+            (
+                DeviceConfig::soapy("driver=lime", 0, "BAND1"),
+                serde_json::json!({"kind": "soapy", "device": "driver=lime", "channel": 0, "antenna": "BAND1"}),
+            ),
+            (
+                DeviceConfig::uhd("type=b200", 1, "TX/RX"),
+                serde_json::json!({"kind": "uhd", "device": "type=b200", "channel": 1, "antenna": "TX/RX"}),
+            ),
+            (
+                DeviceConfig::lime("", 0),
+                serde_json::json!({"kind": "lime", "device": "", "channel": 0}),
+            ),
+            (
+                DeviceConfig::blade_rf("*:serial=1", 0),
+                serde_json::json!({"kind": "blade_rf", "device": "*:serial=1", "channel": 0}),
+            ),
+            (
+                DeviceConfig::network("10.0.0.2:50710"),
+                serde_json::json!({"kind": "network", "addr": "10.0.0.2:50710"}),
+            ),
+        ];
+        for (built, file) in cases {
+            let loaded: DeviceConfig = serde_json::from_value(file).unwrap();
+            assert_eq!(
+                serde_json::to_value(&built).unwrap(),
+                serde_json::to_value(&loaded).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_constructed_config_takes_optional_fields_afterwards() {
+        let mut device = DeviceConfig::uhd("type=b200", 0, "TX/RX");
+        if let DeviceConfig::Uhd {
+            gps,
+            master_clock_rate,
+            ..
+        } = &mut device
+        {
+            *gps = Some(crate::Gps::Pps);
+            *master_clock_rate = Some(39_321_600);
+        }
+        let value = serde_json::to_value(&device).unwrap();
+        assert_eq!(value["gps"], "pps");
+        assert_eq!(value["master_clock_rate"], 39_321_600);
+        assert_eq!(value["tx_gain_db"], 60.0);
     }
 }
