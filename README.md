@@ -37,7 +37,7 @@ API documentation is on [docs.rs](https://docs.rs/sdr-hal).
 
 ```toml
 [dependencies]
-sdr-hal = { version = "0.1", features = ["uhd-backend", "config"] }
+sdr-hal = { version = "0.2", features = ["uhd-backend", "config"] }
 ```
 
 An application sets the rates on the device, splits it into a transmit half and
