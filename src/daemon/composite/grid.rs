@@ -841,6 +841,96 @@ mod tests {
         assert!((magnitude(1_520_000) - 0.25).abs() < 0.02);
     }
 
+    fn pseudo_noise(len: usize, seed: u32) -> Vec<Complex32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let re = (state >> 16) as f32 / 32_768.0 - 1.0;
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let im = (state >> 16) as f32 / 32_768.0 - 1.0;
+                Complex32::new(re, im) * 0.25
+            })
+            .collect()
+    }
+
+    /// Co-channel clients that schedule the same samples at the same ticks must land on
+    /// the same device samples, whenever each one joined and however it batches.
+    #[test]
+    fn co_channel_clients_given_the_same_ticks_land_on_the_same_device_samples() {
+        const CARRIER_HZ: u64 = 869_040_000;
+        const FIRST_BLOCK: u64 = 100;
+        const QUIET_BLOCKS: u64 = 2;
+        const SIGNAL_BLOCKS: u64 = 4;
+        let per_block = 3_240 / RATIO;
+        let signal = pseudo_noise(per_block * SIGNAL_BLOCKS as usize, 7);
+        let signal_block = FIRST_BLOCK + QUIET_BLOCKS;
+
+        let mut alone = grid();
+        let only = alone.add_slot(&plan_for(CARRIER_HZ), PLAN.device_rate_hz, 1.0);
+        let mut together = grid();
+        let early = together.add_slot(&plan_for(CARRIER_HZ), PLAN.device_rate_hz, 1.0);
+        for block in FIRST_BLOCK..signal_block {
+            let ticks = block * alone.block_ticks();
+            let quiet = vec![Complex32::default(); per_block];
+            alone.stage(only, ticks, &quiet);
+            together.stage(early, ticks, &quiet);
+            alone.emit(block).expect("quiet block");
+            together.emit(block).expect("quiet block");
+        }
+
+        let late = together.add_slot(&plan_for(CARRIER_HZ), PLAN.device_rate_hz, 1.0);
+        let start_ticks = signal_block * alone.block_ticks();
+        alone.stage(only, start_ticks, &signal);
+        together.stage(early, start_ticks, &signal);
+        // The late client sends the same samples in pieces that straddle grid blocks.
+        const LATE_PIECE: usize = 97;
+        let ticks_per_client_sample = together.ticks_per_client_sample(late);
+        for (piece, samples) in signal.chunks(LATE_PIECE).enumerate() {
+            let ticks = start_ticks + (piece * LATE_PIECE) as u64 * ticks_per_client_sample;
+            assert_eq!(
+                together.stage(late, ticks, samples),
+                Staged::Placed { rounded_samples: 0 }
+            );
+        }
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for block in signal_block..signal_block + SIGNAL_BLOCKS {
+            let single = alone.emit(block).expect("signal block");
+            let summed = together.emit(block).expect("signal block");
+            assert_eq!(single.time_ticks, summed.time_ticks);
+            second.extend(
+                summed
+                    .samples
+                    .iter()
+                    .zip(&single.samples)
+                    .map(|(sum, one)| sum - one),
+            );
+            first.extend(single.samples);
+        }
+        // Each slot mixes with its own oscillator, so the two copies may differ by one
+        // constant carrier phase. A time offset would not reduce to a constant.
+        let energy: f32 = first.iter().map(|sample| sample.norm_sqr()).sum();
+        let rotation = first
+            .iter()
+            .zip(&second)
+            .map(|(one, two)| two * one.conj())
+            .sum::<Complex32>()
+            / energy;
+        let residual: f32 = first
+            .iter()
+            .zip(&second)
+            .map(|(one, two)| (two - one * rotation).norm_sqr())
+            .sum();
+        assert!(energy > 1.0, "energy={energy}");
+        assert!((rotation.norm() - 1.0).abs() < 1e-3, "rotation={rotation}");
+        assert!(
+            residual < energy * 1e-6,
+            "residual={residual} energy={energy}"
+        );
+    }
+
     #[test]
     fn one_client_falling_silent_still_emits_the_other() {
         let mut grid = grid();

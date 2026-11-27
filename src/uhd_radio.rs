@@ -13,7 +13,71 @@ use uhd::{
 use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
 const BANDWIDTH_READBACK_TOLERANCE_HZ: f64 = 1.0;
+const GPS_TIME_SOURCE: &str = "gpsdo";
+const GPS_TIME_SENSOR: &str = "gps_time";
+/// The raw sentence is cached by UHD, so reading it does not wait for the receiver.
+const GPS_RMC_SENSOR: &str = "gps_gprmc";
+const GPS_GGA_SENSOR: &str = "gps_gpgga";
+/// Reports between reads of the fix data once the receiver has a fix. Each
+/// read uses the control channel the streams share.
+const SATELLITE_READ_EVERY: u32 = 10;
 
+/// The GPS receiver of a USRP and the pulse it latches device time on.
+struct UhdGpsPulse {
+    usrp: Arc<SharedUsrp>,
+    tick_rate: u64,
+    reports: u32,
+    fix_data: nmea::FixData,
+}
+
+impl UhdGpsPulse {
+    fn sensor(&self, name: &str) -> Result<String, Error> {
+        // A GPS sensor read uses the control channel for up to a second.
+        self.usrp
+            .configure(|usrp| usrp.get_mboard_sensor(name, 0))
+            .map_err(|e| {
+                let context = format!("UHD: read sensor {name}: {e}");
+                Error::from(e).context(context)
+            })
+    }
+}
+
+impl crate::discipline::PulseSource for UhdGpsPulse {
+    fn device_ticks(&mut self) -> Result<u64, Error> {
+        self.usrp.current_ticks(self.tick_rate)
+    }
+
+    fn last_pulse_ticks(&mut self) -> Result<u64, Error> {
+        let time = self.usrp.usrp.get_time_last_pps(0).map_err(|e| {
+            let context = format!("UHD: get_time_last_pps: {e}");
+            Error::from(e).context(context)
+        })?;
+        Ok(timespec_to_ticks(&time, self.tick_rate))
+    }
+
+    fn receiver_report(&mut self) -> Result<crate::discipline::ReceiverReport, Error> {
+        let mut report = nmea::parse_rmc(&self.sensor(GPS_RMC_SENSOR)?);
+        // Without a fix the count is what an operator waits on, so it is read every time.
+        if !report.locked || self.reports.is_multiple_of(SATELLITE_READ_EVERY) {
+            self.fix_data = self
+                .sensor(GPS_GGA_SENSOR)
+                .map(|sentence| nmea::parse_gga(&sentence))
+                .unwrap_or_default();
+        }
+        self.reports = self.reports.wrapping_add(1);
+        report.satellites = self.fix_data.satellites;
+        report.position = self.fix_data.position;
+        report.hdop = self.fix_data.hdop;
+        Ok(report)
+    }
+}
+
+type PulseWrap = Box<
+    dyn FnOnce(Box<dyn crate::discipline::PulseSource>) -> Box<dyn crate::discipline::PulseSource>
+        + Send,
+>;
+
+mod nmea;
 mod tx_correction;
 use tx_correction::TxFrequencyCorrection;
 
@@ -268,6 +332,9 @@ pub struct UhdRadio {
     tx_streamer: Option<TransmitStreamer<Complex32>>,
     rx_streamer: Option<ReceiveStreamer<Complex32>>,
     tx_calibration_uses_rx_filter: bool,
+    gps: Option<crate::Gps>,
+    pulse_wrap: Option<PulseWrap>,
+    tx_carrier_hz: Option<f64>,
     // Must drop after the streamers. SoapyUHD streamers crash if the device goes first.
     usrp: Usrp,
 }
@@ -355,6 +422,9 @@ impl UhdRadio {
             tx_streamer: None,
             rx_streamer: None,
             tx_calibration_uses_rx_filter: tx_calibration_uses_rx_filter(&mb_name),
+            gps: None,
+            pulse_wrap: None,
+            tx_carrier_hz: None,
         };
         match tx_sample_rate_hz {
             Some(rate) => {
@@ -375,6 +445,44 @@ impl UhdRadio {
             TxFrequencyCorrection::Hardware
         };
         self
+    }
+
+    /// Whether the device reports a GPS receiver. UHD looks for one once per FPGA load,
+    /// and some boards answer only from the second open after power-up.
+    pub fn has_gps(&self) -> bool {
+        self.usrp
+            .get_mboard_sensor_names(0)
+            .is_ok_and(|names| names.iter().any(|name| name == GPS_TIME_SENSOR))
+    }
+
+    /// Takes the time of each tick from the device's GPS receiver, whose pulse becomes
+    /// the device time source. [`crate::Gps::Pps`] also corrects the
+    /// oscillator error.
+    pub fn with_gps(mut self, gps: crate::Gps) -> Result<Self, Error> {
+        if !self.has_gps() {
+            return Err(Error::unsupported(
+                "GPS time on a device with no GPS receiver",
+            ));
+        }
+        self.set_time_source(GPS_TIME_SOURCE)?;
+        self.gps = Some(gps);
+        Ok(self)
+    }
+
+    /// Like [`Self::with_gps`], with the receiver's pulses passed through `wrap`
+    /// before they reach the clock. An application can use it to drop or delay pulses.
+    pub fn with_gps_through(
+        self,
+        gps: crate::Gps,
+        wrap: impl FnOnce(
+            Box<dyn crate::discipline::PulseSource>,
+        ) -> Box<dyn crate::discipline::PulseSource>
+        + Send
+        + 'static,
+    ) -> Result<Self, Error> {
+        let mut this = self.with_gps(gps)?;
+        this.pulse_wrap = Some(Box::new(wrap));
+        Ok(this)
     }
 
     /// Re-reads the master clock and the applied TX rate. UHD moves the master clock
@@ -503,6 +611,7 @@ impl Radio for UhdRadio {
             result.actual_rf_freq(),
             result.actual_dsp_freq(),
         )?;
+        self.tx_carrier_hz = Some(center_frequency as f64);
         debug!(
             "UHD: TX tune target_rf={} actual_rf={} dsp={}",
             result.target_rf_freq(),
@@ -718,6 +827,26 @@ impl Radio for UhdRadio {
                 channel: rx_channel,
             })
         });
+        if let Some(gps) = this.gps {
+            let source: Box<dyn crate::discipline::PulseSource> = Box::new(UhdGpsPulse {
+                usrp,
+                tick_rate: this.master_clock_rate,
+                reports: 0,
+                fix_data: nmea::FixData::default(),
+            });
+            let source = match this.pulse_wrap {
+                Some(wrap) => wrap(source),
+                None => source,
+            };
+            return crate::discipline::discipline(
+                Box::new(tx),
+                rx,
+                source,
+                this.tx_carrier_hz,
+                None,
+                gps,
+            );
+        }
         Ok((Box::new(tx), rx))
     }
 }

@@ -926,7 +926,94 @@ impl Drop for NetworkRadioTx {
     }
 }
 
+/// Reads the extrapolated server clock and asks the server for its time reference.
+struct NetworkClockReader {
+    rt: Arc<RpcRuntime>,
+    client: RadioControlServiceClient<Channel>,
+    clock: Arc<NetworkClock>,
+}
+
+/// Asks the server for its time reference and keeps the clock status sent with it.
+fn fetch_time_reference(
+    rt: &RpcRuntime,
+    client: &RadioControlServiceClient<Channel>,
+    clock: &NetworkClock,
+) -> Result<Option<crate::TimeReference>, Error> {
+    let mut client = client.clone();
+    match block_on(rt, client.get_time_reference(())) {
+        Ok(response) => {
+            let response = response.into_inner();
+            clock.set_clock_status(response.clock_status.map(|status| {
+                crate::ClockStatus {
+                    lock: response
+                        .reference
+                        .as_ref()
+                        .and_then(|reference| crate::network::decode_time_reference(reference).ok())
+                        .map_or(crate::ReferenceLock::Unlocked, |reference| reference.lock),
+                    rate_error_ppb: status.rate_error_ppb,
+                    phase_error_ns: status.phase_error_ns,
+                    accepted_pulses: status.accepted_pulses,
+                    rejected_pulses: status.rejected_pulses,
+                    receiver_fix: status.receiver_fix,
+                    satellites: status
+                        .satellites
+                        .map(|count| count.min(u32::from(u8::MAX)) as u8),
+                    receiver_unix_seconds: status.receiver_unix_seconds,
+                    position: status.latitude_deg.zip(status.longitude_deg).map(
+                        |(latitude_deg, longitude_deg)| crate::ReceiverPosition {
+                            latitude_deg,
+                            longitude_deg,
+                            altitude_m: status.altitude_m,
+                        },
+                    ),
+                    hdop: status.hdop,
+                    settled: status.settled,
+                    rate_stability_ppb: status.rate_stability_ppb,
+                }
+            }));
+            response
+                .reference
+                .as_ref()
+                .map(crate::network::decode_time_reference)
+                .transpose()
+        }
+        // A server from before this RPC tracks no reference.
+        Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
+        Err(status) => Err(rpc_err("get_time_reference", status)),
+    }
+}
+
+impl crate::RadioClock for NetworkClockReader {
+    fn get_hardware_time(&self) -> Result<u64, Error> {
+        Ok(self.clock.now_ticks())
+    }
+
+    fn time_reference(&self) -> Result<Option<crate::TimeReference>, Error> {
+        fetch_time_reference(&self.rt, &self.client, &self.clock)
+    }
+
+    fn clock_status(&self) -> Option<crate::ClockStatus> {
+        self.clock.clock_status()
+    }
+}
+
 impl RadioTx for NetworkRadioTx {
+    fn clock_reader(&self) -> Option<Box<dyn crate::RadioClock>> {
+        Some(Box::new(NetworkClockReader {
+            rt: self.rt.clone(),
+            client: self.client.clone(),
+            clock: self.clock.clone(),
+        }))
+    }
+
+    fn time_reference(&self) -> Result<Option<crate::TimeReference>, Error> {
+        fetch_time_reference(&self.rt, &self.client, &self.clock)
+    }
+
+    fn clock_status(&self) -> Option<crate::ClockStatus> {
+        self.clock.clock_status()
+    }
+
     fn capabilities(&self) -> crate::TxCapabilities {
         self.capabilities
     }

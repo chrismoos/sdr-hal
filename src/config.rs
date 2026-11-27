@@ -112,6 +112,9 @@ pub enum DeviceConfig {
         /// UHD time-reference source. `None` leaves the driver setting unchanged.
         #[serde(default)]
         time_source: Option<String>,
+        /// The device's GPS hardware, `gpsdo` or `pps`, which enables GPS time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gps: Option<crate::Gps>,
         /// RX port override. `None` uses RX2.
         #[serde(default)]
         rx_antenna: Option<String>,
@@ -821,5 +824,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn uhd_gps_takes_the_hardware_name() {
+        let mut value = serde_json::json!({
+            "kind": "uhd",
+            "device": "type=b200",
+            "channel": 0,
+            "antenna": "TX/RX"
+        });
+        let unset: DeviceConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(unset, DeviceConfig::Uhd { gps: None, .. }));
+        for (name, mode) in [("gpsdo", crate::Gps::Gpsdo), ("pps", crate::Gps::Pps)] {
+            value["gps"] = serde_json::json!(name);
+            let config: DeviceConfig = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                matches!(config, DeviceConfig::Uhd { gps: Some(parsed), .. } if parsed == mode)
+            );
+        }
+        value["gps"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DeviceConfig>(value).is_err());
     }
 }

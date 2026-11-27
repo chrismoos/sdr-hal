@@ -223,6 +223,14 @@ impl RadioTx for CalibratedTx {
         self.inner.clock_reader()
     }
 
+    fn time_reference(&self) -> Result<Option<crate::TimeReference>, Error> {
+        self.inner.time_reference()
+    }
+
+    fn clock_status(&self) -> Option<crate::ClockStatus> {
+        self.inner.clock_status()
+    }
+
     fn capabilities(&self) -> crate::TxCapabilities {
         self.inner.capabilities()
     }

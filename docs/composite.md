@@ -30,17 +30,30 @@ serves two 1x carriers, on BC0 channels 690 and 649:
 | `block_duration_ms` | length of each block the device streams, 2 ms when omitted. Rounded to whole device samples. RX latency is about one block |
 | `tx_deadline_ms` | how long before air time missing client samples become silence, 5 ms when omitted |
 
-- **Fit:** each carrier's offset from center plus half its sample rate must be
-  at most half of `device_rate_hz`.
-- **Rates:** any fraction of `device_rate_hz` up to 4096/4096, in any
-  combination and connection order.
-- **TX lead:** a client's samples must reach the server at least
-  `tx_deadline_ms` plus `block_duration_ms` before air time, plus margin for
-  scheduling and network delay. Later samples are dropped.
-- **Gain, bandwidth and LO offset** are set by the server. Client requests are
-  logged and ignored.
-- **A client that leaves** frees its slot. When the last one goes quiet, the
-  device stops transmitting.
+## Carriers and rates
+
+Each client's carrier must fit inside the shared stream: its offset from the
+center frequency plus half its sample rate must be at most half of
+`device_rate_hz`. Clients may use different sample rates, up to the full device
+rate, and connect in any order. Clients on the same carrier are summed, and
+`sdr-radiod plan` warns when carriers overlap.
+
+## TX timing
+
+A client's samples must reach the server at least `tx_deadline_ms` plus
+`block_duration_ms` before air time, plus margin for scheduling and network
+delay. Later samples are dropped.
+
+## Device settings
+
+Gain, bandwidth and LO offset are set by the server for the whole device. Client
+requests to change them are logged and ignored. Every client receives the same
+`time_reference()`.
+
+## Disconnecting
+
+A client that disconnects frees its slot. The device stops transmitting when no
+client is sending.
 
 ## Planning a configuration
 

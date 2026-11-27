@@ -140,10 +140,16 @@ mod clock;
 /// Shared error type for driver, I/O, and unsupported-operation failures.
 pub mod error;
 pub use calibration::{CalibratedRadio, RadioCalibration};
+#[cfg(feature = "dsp")]
+pub mod discipline;
 mod radio;
 mod stream;
+mod time_reference;
 pub use radio::{Radio, RadioClock, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 pub use stream::{DeviceTime, ReadTimeout, Schedule, TxCapabilities, TxCapability, TxMetadata};
+pub use time_reference::{
+    ClockStatus, Gps, ReceiverPosition, ReferenceLock, ReferenceSource, TimeReference,
+};
 mod noop;
 pub use noop::NoopRadio;
 #[cfg(feature = "file")]

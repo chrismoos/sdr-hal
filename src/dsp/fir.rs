@@ -17,8 +17,10 @@
 use num_complex::Complex32;
 
 mod kernels;
-pub(crate) use kernels::dot_re_im;
 use kernels::symmetric_complex_accumulate;
+pub(crate) use kernels::{FractionalRun, dot_re_im, fractional_run, interleaved_dot_name};
+#[cfg(test)]
+pub(crate) use kernels::{interleaved_dot, interleaved_dot_scalar};
 
 /// Real-input FIR with optional integer interpolation.
 pub struct Fir32 {

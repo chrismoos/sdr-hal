@@ -45,6 +45,8 @@ struct FakeState {
     rx_tick_rate: Option<u64>,
     tick_rate: Option<u64>,
     tx_write_delay: Option<Duration>,
+    /// The reference and clock status of a radio that tracks its own time.
+    own_time: Option<(sdr_hal::TimeReference, sdr_hal::ClockStatus)>,
 }
 
 struct FakeClock {
@@ -173,6 +175,14 @@ struct FakeTx {
 }
 
 impl RadioTx for FakeTx {
+    fn time_reference(&self) -> Result<Option<sdr_hal::TimeReference>, Error> {
+        Ok(self.state.lock().own_time.map(|(reference, _)| reference))
+    }
+
+    fn clock_status(&self) -> Option<sdr_hal::ClockStatus> {
+        self.state.lock().own_time.map(|(_, status)| status)
+    }
+
     fn capabilities(&self) -> sdr_hal::TxCapabilities {
         let capabilities = sdr_hal::TxCapabilities::from([sdr_hal::TxCapability::BurstEnd]);
         if self.supports_timed_tx() {
@@ -417,6 +427,83 @@ fn client_connects_from_multithreaded_tokio_runtime() {
             .set_tx_frequency(881_520_000)
             .expect("control RPC from async runtime");
     });
+}
+
+#[test]
+fn a_client_receives_the_reference_and_clock_status_of_a_gps_disciplined_radio() {
+    let reference = sdr_hal::TimeReference {
+        device_ticks: 123_456_789,
+        seconds: 1_479_639_161,
+        subsecond_ns: 13,
+        leap_seconds: 0,
+        source: sdr_hal::ReferenceSource::Gps,
+        lock: sdr_hal::ReferenceLock::Holdover,
+        uncertainty_ns: 450,
+    };
+    let status = sdr_hal::ClockStatus {
+        lock: sdr_hal::ReferenceLock::Holdover,
+        rate_error_ppb: -237.4,
+        phase_error_ns: 30.5,
+        accepted_pulses: 61,
+        rejected_pulses: 2,
+        receiver_fix: true,
+        satellites: Some(9),
+        receiver_unix_seconds: Some(1_795_602_425.5),
+        position: Some(sdr_hal::ReceiverPosition {
+            latitude_deg: 33.3393,
+            longitude_deg: -111.7161,
+            altitude_m: Some(412.1),
+        }),
+        hdop: Some(1.1),
+        settled: true,
+        rate_stability_ppb: Some(0.49),
+    };
+    let state = Arc::new(Mutex::new(FakeState {
+        own_time: Some((reference, status)),
+        ..FakeState::default()
+    }));
+    let (_server, control_addr) = start_server(state);
+    let mut radio = Box::new(
+        NetworkRadio::connect(&control_addr.to_string(), NetworkRadioOptions::default())
+            .expect("client connects"),
+    );
+    radio
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
+        .expect("sample rate");
+    let (tx, _rx) = (radio as Box<dyn Radio>).split().expect("split");
+
+    assert_eq!(
+        tx.clock_status(),
+        None,
+        "no status before a reference is read"
+    );
+    assert_eq!(tx.time_reference().unwrap(), Some(reference));
+    assert_eq!(tx.clock_status(), Some(status));
+    let reader = tx
+        .clock_reader()
+        .expect("a network radio has a clock reader");
+    assert_eq!(reader.time_reference().unwrap(), Some(reference));
+    assert_eq!(reader.clock_status(), Some(status));
+}
+
+#[test]
+fn a_radio_without_its_own_reference_reports_the_host_clock_and_no_status() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (_server, control_addr) = start_server(state);
+    let mut radio = Box::new(
+        NetworkRadio::connect(&control_addr.to_string(), NetworkRadioOptions::default())
+            .expect("client connects"),
+    );
+    radio
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
+        .expect("sample rate");
+    let (tx, _rx) = (radio as Box<dyn Radio>).split().expect("split");
+    let reference = tx
+        .time_reference()
+        .unwrap()
+        .expect("the server pairs the host clock");
+    assert_eq!(reference.source, sdr_hal::ReferenceSource::HostClock);
+    assert_eq!(tx.clock_status(), None);
 }
 
 #[test]

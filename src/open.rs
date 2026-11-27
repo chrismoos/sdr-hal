@@ -57,6 +57,13 @@ pub(crate) fn open(config: &RadioConfig) -> Result<Box<dyn Radio>, Error> {
     ))
 }
 
+#[cfg(feature = "uhd-backend")]
+const GPS_TIME_SOURCE: &str = "gpsdo";
+/// Clock sources that lock the oscillator to a reference, which `Gps::Gpsdo`
+/// relies on.
+#[cfg(feature = "uhd-backend")]
+const LOCKED_CLOCK_SOURCES: [&str; 2] = ["gpsdo", "external"];
+
 /// Opens the configured device. An absent rate leaves TX unconfigured, which lets a
 /// caller that negotiates the rate later open the device first.
 fn open_radio(
@@ -101,23 +108,53 @@ fn open_radio(
             max_master_clock_rate,
             clock_source,
             time_source,
+            gps,
             ..
         } => {
-            let radio = crate::UhdRadio::new(
-                device,
-                *channel,
-                antenna,
-                *tx_gain_db,
-                *master_clock_rate,
-                *max_master_clock_rate,
-                tx_sample_rate_hz,
-            )?
-            .with_software_tx_frequency_correction(*software_tx_frequency_correction);
+            let open = || {
+                crate::UhdRadio::new(
+                    device,
+                    *channel,
+                    antenna,
+                    *tx_gain_db,
+                    *master_clock_rate,
+                    *max_master_clock_rate,
+                    tx_sample_rate_hz,
+                )
+            };
+            let mut radio = open()?;
+            if gps.is_some() && !radio.has_gps() {
+                // UHD looks for a GPS receiver once per FPGA load. A receiver that is
+                // configured by that first open is found by the next one.
+                drop(radio);
+                radio = open()?;
+            }
+            let radio =
+                radio.with_software_tx_frequency_correction(*software_tx_frequency_correction);
             if let Some(source) = clock_source {
                 radio.set_clock_source(source)?;
             }
             if let Some(source) = time_source {
                 radio.set_time_source(source)?;
+            }
+            if let Some(gps) = *gps {
+                if time_source
+                    .as_deref()
+                    .is_some_and(|source| source != GPS_TIME_SOURCE)
+                {
+                    return Err(Error::invalid_setting(
+                        "gps uses the gpsdo time source, so time_source must be gpsdo or unset",
+                    ));
+                }
+                let locked_clock = clock_source
+                    .as_deref()
+                    .is_some_and(|source| LOCKED_CLOCK_SOURCES.contains(&source));
+                if gps == crate::Gps::Gpsdo && !locked_clock {
+                    return Err(Error::invalid_setting(
+                        "gps \"gpsdo\" expects a GPS-disciplined oscillator, so clock_source must be gpsdo or external. Use \"pps\" for a free-running oscillator",
+                    ));
+                }
+                return Ok(Box::new(radio.with_gps(gps)?));
             }
             Ok(Box::new(radio))
         }

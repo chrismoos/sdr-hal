@@ -24,6 +24,8 @@ Transmitting requires authorization for the frequencies in use.
   `sdr-radiod`.
 - [Composite mode](docs/composite.md): several clients on one device, and
   `sdr-radiod plan` for choosing its settings.
+- [GPS time](docs/gps-time.md): disciplining a USRP's stream clock and carriers
+  to its GPS receiver.
 - [SoapySDR module](docs/soapy.md): using an `sdr-radiod` server from GNU Radio,
   SDR++ and other SoapySDR applications.
 - [Streaming benchmark](docs/sdr-bench.md): checking that a host and driver

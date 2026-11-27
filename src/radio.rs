@@ -161,6 +161,14 @@ fn validate_schedule(
 pub trait RadioClock: Send {
     /// Returns ticks in the same epoch and rate as the stream that supplied this reader.
     fn get_hardware_time(&self) -> Result<u64, Error>;
+    /// The time at a device tick, as [`RadioTx::time_reference`] reports it. The call can block.
+    fn time_reference(&self) -> Result<Option<crate::TimeReference>, Error> {
+        Ok(None)
+    }
+    /// State of the clock when it is disciplined to an external reference.
+    fn clock_status(&self) -> Option<crate::ClockStatus> {
+        None
+    }
 }
 
 /// A transmit stream that accepts complex IQ at the configured sample rate.
@@ -174,6 +182,19 @@ pub trait RadioClock: Send {
 pub trait RadioTx: Send {
     /// Independent reader for moving blocking device-time reads off the stream owner.
     fn clock_reader(&self) -> Option<Box<dyn RadioClock>> {
+        None
+    }
+
+    /// The time at a device tick, when the radio or its server tracks one. Every client
+    /// of one shared device receives the same reference, so clients that schedule from
+    /// it agree on the time of every tick. The default returns `None`.
+    fn time_reference(&self) -> Result<Option<crate::TimeReference>, Error> {
+        Ok(None)
+    }
+
+    /// State of the clock when it is disciplined to an external reference. The default
+    /// returns `None`.
+    fn clock_status(&self) -> Option<crate::ClockStatus> {
         None
     }
 
@@ -444,6 +465,14 @@ pub trait RadioRx: Send {
 impl RadioTx for Box<dyn RadioTx> {
     fn clock_reader(&self) -> Option<Box<dyn RadioClock>> {
         (**self).clock_reader()
+    }
+
+    fn time_reference(&self) -> Result<Option<crate::TimeReference>, Error> {
+        (**self).time_reference()
+    }
+
+    fn clock_status(&self) -> Option<crate::ClockStatus> {
+        (**self).clock_status()
     }
 
     fn capabilities(&self) -> crate::TxCapabilities {

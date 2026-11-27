@@ -97,6 +97,38 @@ struct Shared {
     tx_gain_bits: AtomicU64,
     /// TX power estimate at the applied gain as `f32` bits, NaN when unknown.
     tx_estimate_bits: AtomicU32,
+    /// The reference every client receives, kept while the device clock still agrees with it.
+    time_reference: tokio::sync::Mutex<Option<HeldTimeReference>>,
+}
+
+/// A time reference and what is needed to tell whether the device clock still matches it.
+struct HeldTimeReference {
+    reference: crate::TimeReference,
+    tick_rate: u64,
+    taken_at: std::time::Instant,
+}
+
+/// Device clock error against a held reference that is taken for a reset, not drift.
+const REFERENCE_RESET_FLOOR: std::time::Duration = std::time::Duration::from_millis(50);
+/// Oscillator error allowed to accumulate before a held reference counts as reset.
+const REFERENCE_DRIFT_PPM: u128 = 100;
+const REFERENCE_CLOCK_READS: usize = 8;
+
+impl HeldTimeReference {
+    /// Whether a device clock reading of `device_ticks` now continues this reference's
+    /// epoch. A reopened device, a clock reset or a stream that restarts its counter
+    /// moves the clock by far more than oscillator drift does.
+    fn matches(&self, tick_rate: u64, device_ticks: u64, now: std::time::Instant) -> bool {
+        if tick_rate != self.tick_rate {
+            return false;
+        }
+        let elapsed = now.saturating_duration_since(self.taken_at);
+        let elapsed_ticks = elapsed.as_nanos() * u128::from(tick_rate) / 1_000_000_000;
+        let expected = u128::from(self.reference.device_ticks) + elapsed_ticks;
+        let allowed = REFERENCE_RESET_FLOOR.as_nanos() * u128::from(tick_rate) / 1_000_000_000
+            + elapsed_ticks * REFERENCE_DRIFT_PPM / 1_000_000;
+        expected.abs_diff(u128::from(device_ticks)) <= allowed
+    }
 }
 
 /// gRPC control implementation created by [`serve`]. Sessions own the split radio streams.
@@ -245,6 +277,65 @@ fn ignored_device_setting(name: &str, requested: impl std::fmt::Display) {
 impl RadioControlSvc {
     fn composite(&self) -> Option<&Mutex<ClientRegistry>> {
         self.shared.composite.as_deref()
+    }
+
+    /// Reads the device clock, whole or split.
+    async fn device_time(&self) -> Result<u64, Status> {
+        // Before a session the radio is still whole, so it answers directly.
+        if let State::Idle(idle) = &*self.shared.settled_state().await {
+            return idle.radio.hardware_time().map_err(internal);
+        }
+        let (reply, reply_rx) = oneshot::channel();
+        self.shared
+            .tx_command(TxCommand::GetHardwareTime(reply))
+            .await?;
+        await_reply(reply_rx).await
+    }
+
+    /// The reference of a streaming radio that tracks its own. `None` before a session
+    /// and for a radio that tracks none.
+    async fn radio_time_reference(
+        &self,
+    ) -> Result<Option<(crate::TimeReference, Option<crate::ClockStatus>)>, Status> {
+        if !matches!(&*self.shared.settled_state().await, State::Running(_)) {
+            return Ok(None);
+        }
+        let (reply, reply_rx) = oneshot::channel();
+        self.shared
+            .tx_command(TxCommand::GetTimeReference(reply))
+            .await?;
+        let (reference, clock_status) = reply_rx
+            .await
+            .map_err(|_| Status::unavailable("radio TX bridge stopped"))?;
+        Ok(reference
+            .map_err(internal)?
+            .map(|reference| (reference, clock_status)))
+    }
+
+    /// Pairs the host clock with the device clock read that had the shortest round trip.
+    async fn read_time_reference(&self) -> Result<HeldTimeReference, Status> {
+        let tick_rate = self.device_tick_rate().await?;
+        let mut best: Option<(HeldTimeReference, std::time::Duration)> = None;
+        for _ in 0..REFERENCE_CLOCK_READS {
+            let started = std::time::Instant::now();
+            let device_ticks = self.device_time().await?;
+            let round_trip = started.elapsed();
+            if best.as_ref().is_some_and(|(_, trip)| round_trip >= *trip) {
+                continue;
+            }
+            let reference = crate::TimeReference::host_clock_pair(device_ticks, round_trip)
+                .map_err(internal)?;
+            best = Some((
+                HeldTimeReference {
+                    reference,
+                    tick_rate,
+                    taken_at: started + round_trip / 2,
+                },
+                round_trip,
+            ));
+        }
+        best.map(|(held, _)| held)
+            .ok_or_else(|| Status::internal("no device clock read completed"))
     }
 
     async fn device_tick_rate(&self) -> Result<u64, Status> {
@@ -1092,17 +1183,63 @@ impl RadioControlService for RadioControlSvc {
         &self,
         _request: Request<()>,
     ) -> Result<Response<proto::HardwareTime>, Status> {
-        // Before a session the radio is still whole, so it answers directly.
-        if let State::Idle(idle) = &*self.shared.settled_state().await {
-            let time_ticks = idle.radio.hardware_time().map_err(internal)?;
-            return Ok(Response::new(proto::HardwareTime { time_ticks }));
-        }
-        let (reply, reply_rx) = oneshot::channel();
-        self.shared
-            .tx_command(TxCommand::GetHardwareTime(reply))
-            .await?;
-        let time_ticks = await_reply(reply_rx).await?;
+        let time_ticks = self.device_time().await?;
         Ok(Response::new(proto::HardwareTime { time_ticks }))
+    }
+
+    async fn get_time_reference(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<proto::GetTimeReferenceResponse>, Status> {
+        if let Some((reference, clock_status)) = self.radio_time_reference().await? {
+            return Ok(Response::new(proto::GetTimeReferenceResponse {
+                reference: Some(crate::network::encode_time_reference(reference)),
+                clock_status: clock_status.map(|status| proto::ClockStatus {
+                    rate_error_ppb: status.rate_error_ppb,
+                    phase_error_ns: status.phase_error_ns,
+                    accepted_pulses: status.accepted_pulses,
+                    rejected_pulses: status.rejected_pulses,
+                    receiver_fix: status.receiver_fix,
+                    satellites: status.satellites.map(u32::from),
+                    receiver_unix_seconds: status.receiver_unix_seconds,
+                    latitude_deg: status.position.map(|position| position.latitude_deg),
+                    longitude_deg: status.position.map(|position| position.longitude_deg),
+                    altitude_m: status.position.and_then(|position| position.altitude_m),
+                    hdop: status.hdop,
+                    settled: status.settled,
+                    rate_stability_ppb: status.rate_stability_ppb,
+                }),
+            }));
+        }
+        // Held across the reads so two clients cannot each take their own reference.
+        let mut held = self.shared.time_reference.lock().await;
+        let tick_rate = self.device_tick_rate().await?;
+        let device_ticks = self.device_time().await?;
+        let still_valid = held
+            .as_ref()
+            .is_some_and(|held| held.matches(tick_rate, device_ticks, std::time::Instant::now()));
+        if !still_valid {
+            let fresh = self.read_time_reference().await?;
+            info!(
+                "radiod: time reference taken: device_ticks={} seconds={} subsecond_ns={} tick_rate={} uncertainty_ns={}{}",
+                fresh.reference.device_ticks,
+                fresh.reference.seconds,
+                fresh.reference.subsecond_ns,
+                fresh.tick_rate,
+                fresh.reference.uncertainty_ns,
+                if held.is_some() {
+                    ", replacing one the device clock no longer matches"
+                } else {
+                    ""
+                },
+            );
+            *held = Some(fresh);
+        }
+        let reference = held.as_ref().map(|held| held.reference);
+        Ok(Response::new(proto::GetTimeReferenceResponse {
+            reference: reference.map(crate::network::encode_time_reference),
+            clock_status: None,
+        }))
     }
 
     async fn set_hardware_time(
@@ -1460,6 +1597,7 @@ pub async fn serve(
         ),
         radio_calibration,
         rx_sample_rate_hz: Arc::new(AtomicU64::new(0)),
+        time_reference: tokio::sync::Mutex::new(None),
         tx_gain_range_db,
         tx_gain_bits: AtomicU64::new(tx_gain_db.unwrap_or(f64::NAN).to_bits()),
     });
@@ -1680,4 +1818,52 @@ fn bind_data_listeners(address: SocketAddr) -> Result<(UdpSocket, std::net::TcpL
         }
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod time_reference_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const TICK_RATE: u64 = 9_720_000;
+
+    fn held(device_ticks: u64, taken_at: Instant) -> HeldTimeReference {
+        HeldTimeReference {
+            reference: crate::TimeReference {
+                device_ticks,
+                seconds: 1_479_000_000,
+                subsecond_ns: 0,
+                leap_seconds: 0,
+                source: crate::ReferenceSource::HostClock,
+                lock: crate::ReferenceLock::Locked,
+                uncertainty_ns: 0,
+            },
+            tick_rate: TICK_RATE,
+            taken_at,
+        }
+    }
+
+    #[test]
+    fn held_reference_matches_a_clock_that_kept_counting() {
+        let taken_at = Instant::now();
+        let held = held(1_000_000, taken_at);
+        let hour = Duration::from_secs(3_600);
+        // 20 ppm fast for an hour.
+        let device_ticks = 1_000_000 + TICK_RATE * 3_600 + TICK_RATE * 3_600 * 20 / 1_000_000;
+        assert!(held.matches(TICK_RATE, device_ticks, taken_at + hour));
+    }
+
+    #[test]
+    fn held_reference_does_not_match_a_restarted_clock() {
+        let taken_at = Instant::now();
+        let held = held(TICK_RATE * 500, taken_at);
+        assert!(!held.matches(TICK_RATE, 0, taken_at + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn held_reference_does_not_match_another_tick_rate() {
+        let taken_at = Instant::now();
+        let held = held(1_000_000, taken_at);
+        assert!(!held.matches(TICK_RATE * 2, 1_000_000, taken_at));
+    }
 }

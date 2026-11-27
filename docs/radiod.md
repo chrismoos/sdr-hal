@@ -49,20 +49,32 @@ accepts both, so clients can use different transports:
 Client and server must be the same version. There is one wire version and no
 negotiation.
 
-## Behavior
+## Clock
 
-- Timestamps are the server device's ticks, and `tick_rate()` reports that
-  clock. The server selects a clock that fits the client's rates. `tick_rate`
-  should be set only when a specific clock is required, and before any sample
-  rate.
-- `get_hardware_time()` reads slightly behind the device. It is suitable for
-  choosing a TX lead, not for an exact tick. RX timestamps come from the device
-  itself.
-- TX stops when samples stop arriving. A graceful shutdown stops TX and RX
-  before exiting. Both are the host's own report, not proof that the radio
-  stopped radiating.
-- A client whose host stops answering is released after about 15 seconds.
-- Calibration values (`rx_to_tx_delay_ns`, `tx_full_scale_power_estimate_dbm`,
-  `rx_reference_dbm`) from the hardware file are passed to clients and take
-  precedence over the backend's own. The RX reference is unavailable while RX
-  gain differs from the gain it was measured at.
+Timestamps count the server device's ticks, at the rate `tick_rate()` returns.
+The server selects a clock that fits the client's rates. Set `tick_rate` only
+when a specific clock is required, before any sample rate.
+
+`get_hardware_time()` reads slightly behind the device, so it is suitable for
+choosing a TX lead but not for an exact tick. RX timestamps come from the device.
+
+## Time reference
+
+`time_reference()` returns the UTC time at one device tick. Every client of a
+server receives the same reference, so clients agree on the time of every tick.
+The reference pairs the server host's clock with a device clock read, and a new
+one is made when the device is reopened or its clock is reset. A device opened
+with [`gps`](gps-time.md) returns its GPS reference instead.
+
+## Stopping
+
+TX stops when samples stop arriving. A graceful shutdown stops TX and RX before
+exiting. Neither proves that the radio stopped radiating. A client whose host
+stops answering is released after about 15 seconds.
+
+## Calibration
+
+Calibration values in the radio config (`rx_to_tx_delay_ns`,
+`tx_full_scale_power_estimate_dbm`, `rx_reference_dbm`) are passed to clients and
+take precedence over the backend's own. The RX reference is unavailable while the
+RX gain differs from the gain it was measured at.

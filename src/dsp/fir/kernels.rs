@@ -366,3 +366,274 @@ pub(super) fn polyphase_avx_4x(
     unsafe { _mm256_storeu_ps(iq.as_mut_ptr(), scaled) };
     std::array::from_fn(|phase| Complex32::new(iq[phase], iq[phase + SSE_LANES]))
 }
+
+/// Dot product of real `taps` with the first `taps.len()` interleaved complex
+/// `samples`. The tap count must be a multiple of eight.
+#[cfg(test)]
+pub(crate) type InterleavedDot = fn(taps: &[f32], samples: &[Complex32]) -> Complex32;
+
+/// The instruction set [`interleaved_dot`] selects on this CPU.
+pub(crate) fn interleaved_dot_name() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return "NEON";
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return "AVX2 with FMA";
+        }
+        return "SSE2";
+    }
+    #[allow(unreachable_code)]
+    "scalar"
+}
+
+/// The fastest [`InterleavedDot`] this CPU runs.
+#[cfg(test)]
+pub(crate) fn interleaved_dot() -> InterleavedDot {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return |taps, samples| {
+            assert!(taps.len().is_multiple_of(8) && samples.len() >= taps.len());
+            // SAFETY: NEON is part of the aarch64 baseline, and the assert covers every read.
+            unsafe { interleaved_dot_neon(taps, samples) }
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return |taps, samples| {
+                assert!(taps.len().is_multiple_of(8) && samples.len() >= taps.len());
+                // SAFETY: The caller of `interleaved_dot` detected AVX2 and FMA, and the assert covers every read.
+                unsafe { interleaved_dot_avx2(taps, samples) }
+            };
+        }
+        return |taps, samples| {
+            assert!(taps.len().is_multiple_of(8) && samples.len() >= taps.len());
+            // SAFETY: SSE2 is part of the x86_64 baseline, and the assert covers every read.
+            unsafe { interleaved_dot_sse2(taps, samples) }
+        };
+    }
+    #[allow(unreachable_code)]
+    interleaved_dot_scalar
+}
+
+pub(crate) fn interleaved_dot_scalar(taps: &[f32], samples: &[Complex32]) -> Complex32 {
+    let mut re = 0f32;
+    let mut im = 0f32;
+    for (sample, weight) in samples[..taps.len()].iter().zip(taps) {
+        re += sample.re * weight;
+        im += sample.im * weight;
+    }
+    Complex32::new(re, im)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interleaved_dot_neon(taps: &[f32], samples: &[Complex32]) -> Complex32 {
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vld2q_f32};
+
+    let data = samples.as_ptr().cast::<f32>();
+    let (mut re_a, mut im_a) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    let (mut re_b, mut im_b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    for tap in (0..taps.len()).step_by(8) {
+        // SAFETY: `tap + 8 <= taps.len() <= samples.len()`, and a `Complex32` is two `f32`.
+        unsafe {
+            let first = vld2q_f32(data.add(2 * tap));
+            let second = vld2q_f32(data.add(2 * tap + 8));
+            let weights_a = vld1q_f32(taps.as_ptr().add(tap));
+            let weights_b = vld1q_f32(taps.as_ptr().add(tap + 4));
+            re_a = vfmaq_f32(re_a, first.0, weights_a);
+            im_a = vfmaq_f32(im_a, first.1, weights_a);
+            re_b = vfmaq_f32(re_b, second.0, weights_b);
+            im_b = vfmaq_f32(im_b, second.1, weights_b);
+        }
+    }
+    Complex32::new(
+        vaddvq_f32(vaddq_f32(re_a, re_b)),
+        vaddvq_f32(vaddq_f32(im_a, im_b)),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn interleaved_dot_sse2(taps: &[f32], samples: &[Complex32]) -> Complex32 {
+    use std::arch::x86_64::{_mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_shuffle_ps};
+
+    /// Lanes 0 and 2 of each operand, which are the real parts of two samples.
+    const REAL_LANES: i32 = 0b10_00_10_00;
+    /// Lanes 1 and 3 of each operand, the imaginary parts.
+    const IMAGINARY_LANES: i32 = 0b11_01_11_01;
+    let data = samples.as_ptr().cast::<f32>();
+    let (mut re, mut im) = (_mm_setzero_ps(), _mm_setzero_ps());
+    for tap in (0..taps.len()).step_by(4) {
+        // SAFETY: `tap + 4 <= taps.len() <= samples.len()`, and a `Complex32` is two `f32`.
+        unsafe {
+            let low = _mm_loadu_ps(data.add(2 * tap));
+            let high = _mm_loadu_ps(data.add(2 * tap + 4));
+            let weights = _mm_loadu_ps(taps.as_ptr().add(tap));
+            re = _mm_add_ps(
+                re,
+                _mm_mul_ps(_mm_shuffle_ps::<REAL_LANES>(low, high), weights),
+            );
+            im = _mm_add_ps(
+                im,
+                _mm_mul_ps(_mm_shuffle_ps::<IMAGINARY_LANES>(low, high), weights),
+            );
+        }
+    }
+    // SAFETY: SSE is part of what this function enables.
+    unsafe { Complex32::new(hsum_f32x4_sse(re), hsum_f32x4_sse(im)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interleaved_dot_avx2(taps: &[f32], samples: &[Complex32]) -> Complex32 {
+    use std::arch::x86_64::{
+        _mm_add_ps, _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps,
+        _mm256_loadu_ps, _mm256_permutevar8x32_ps, _mm256_setr_epi32, _mm256_setzero_ps,
+        _mm256_shuffle_ps,
+    };
+
+    const REAL_LANES: i32 = 0b10_00_10_00;
+    const IMAGINARY_LANES: i32 = 0b11_01_11_01;
+    // A 256-bit shuffle works inside each 128-bit half, so eight samples come out in
+    // the order 0 1 4 5 2 3 6 7. The taps are put in that order to match.
+    let tap_order = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+    let data = samples.as_ptr().cast::<f32>();
+    let (mut re, mut im) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for tap in (0..taps.len()).step_by(8) {
+        // SAFETY: `tap + 8 <= taps.len() <= samples.len()`, and a `Complex32` is two `f32`.
+        unsafe {
+            let low = _mm256_loadu_ps(data.add(2 * tap));
+            let high = _mm256_loadu_ps(data.add(2 * tap + 8));
+            let weights =
+                _mm256_permutevar8x32_ps(_mm256_loadu_ps(taps.as_ptr().add(tap)), tap_order);
+            re = _mm256_fmadd_ps(_mm256_shuffle_ps::<REAL_LANES>(low, high), weights, re);
+            im = _mm256_fmadd_ps(_mm256_shuffle_ps::<IMAGINARY_LANES>(low, high), weights, im);
+        }
+    }
+    // SAFETY: SSE is part of what this function enables.
+    unsafe {
+        Complex32::new(
+            hsum_f32x4_sse(_mm_add_ps(
+                _mm256_castps256_ps128(re),
+                _mm256_extractf128_ps::<1>(re),
+            )),
+            hsum_f32x4_sse(_mm_add_ps(
+                _mm256_castps256_ps128(im),
+                _mm256_extractf128_ps::<1>(im),
+            )),
+        )
+    }
+}
+
+/// Reads `samples` at `out.len()` positions `start`, `start + step`, and so on, each
+/// with the `rows` entry nearest its fractional part. Position `p` reads the `N`
+/// samples from `floor(p)`. The last row is the fraction one.
+pub(crate) type FractionalRun<const N: usize> =
+    fn(rows: &[[f32; N]], samples: &[Complex32], start: f64, step: f64, out: &mut [Complex32]);
+
+/// The fastest [`FractionalRun`] this CPU runs. `N` must be a multiple of eight.
+pub(crate) fn fractional_run<const N: usize>() -> FractionalRun<N> {
+    assert!(N.is_multiple_of(8));
+    #[cfg(target_arch = "aarch64")]
+    {
+        return |rows, samples, start, step, out| {
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { fractional_run_neon(rows, samples, start, step, out) }
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return |rows, samples, start, step, out| {
+                // SAFETY: The caller of `fractional_run` detected AVX2 and FMA.
+                unsafe { fractional_run_avx2(rows, samples, start, step, out) }
+            };
+        }
+        return |rows, samples, start, step, out| {
+            // SAFETY: SSE2 is part of the x86_64 baseline.
+            unsafe { fractional_run_sse2(rows, samples, start, step, out) }
+        };
+    }
+    #[allow(unreachable_code)]
+    {
+        |rows, samples, start, step, out| {
+            fractional_run_with(rows, samples, start, step, out, |row, window| {
+                interleaved_dot_scalar(row, window)
+            })
+        }
+    }
+}
+
+/// The loop every [`FractionalRun`] shares. It is inlined into a caller that enables
+/// an instruction set, so `dot` is compiled for that set without a call per sample.
+#[inline(always)]
+fn fractional_run_with<const N: usize>(
+    rows: &[[f32; N]],
+    samples: &[Complex32],
+    start: f64,
+    step: f64,
+    out: &mut [Complex32],
+    dot: impl Fn(&[f32], &[Complex32]) -> Complex32,
+) {
+    assert!(start >= 0.0 && step >= 0.0);
+    let phases = (rows.len() - 1) as f64;
+    for (index, slot) in out.iter_mut().enumerate() {
+        let position = start + index as f64 * step;
+        // A cast truncates, which is the floor of a position that is not negative.
+        let whole = position as usize;
+        let row = &rows[((position - whole as f64) * phases + 0.5) as usize];
+        *slot = dot(row, &samples[whole..whole + N]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fractional_run_neon<const N: usize>(
+    rows: &[[f32; N]],
+    samples: &[Complex32],
+    start: f64,
+    step: f64,
+    out: &mut [Complex32],
+) {
+    fractional_run_with(rows, samples, start, step, out, |row, window| {
+        // SAFETY: The loop passes exactly `N` samples, and `N` is a multiple of eight.
+        unsafe { interleaved_dot_neon(row, window) }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn fractional_run_sse2<const N: usize>(
+    rows: &[[f32; N]],
+    samples: &[Complex32],
+    start: f64,
+    step: f64,
+    out: &mut [Complex32],
+) {
+    fractional_run_with(rows, samples, start, step, out, |row, window| {
+        // SAFETY: The loop passes exactly `N` samples, and `N` is a multiple of eight.
+        unsafe { interleaved_dot_sse2(row, window) }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fractional_run_avx2<const N: usize>(
+    rows: &[[f32; N]],
+    samples: &[Complex32],
+    start: f64,
+    step: f64,
+    out: &mut [Complex32],
+) {
+    fractional_run_with(rows, samples, start, step, out, |row, window| {
+        // SAFETY: The loop passes exactly `N` samples, and `N` is a multiple of eight.
+        unsafe { interleaved_dot_avx2(row, window) }
+    });
+}

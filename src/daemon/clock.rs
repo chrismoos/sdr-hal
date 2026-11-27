@@ -10,11 +10,15 @@ use crate::{RadioClock, RadioTx};
 const CLOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_QUERY_DURATION: Duration = Duration::from_millis(1);
 const STARTUP_SAMPLE_ATTEMPTS: usize = 8;
+/// Consecutive slow refreshes after which one is used anyway, so a device whose
+/// queries never meet `MAX_QUERY_DURATION` still has its drift corrected.
+const SLOW_REFRESHES_BEFORE_ACCEPTING: u64 = 5;
 
 #[derive(Default)]
 struct ClockMetrics {
     max_refresh_us: AtomicU64,
     rejected_queries: AtomicU64,
+    consecutive_slow: AtomicU64,
     uncertainty_us: AtomicU64,
 }
 
@@ -41,14 +45,22 @@ impl ClockReading {
             .max_refresh_us
             .fetch_max(self.elapsed.as_micros() as u64, Ordering::Relaxed);
         if self.elapsed > MAX_QUERY_DURATION {
-            metrics.rejected_queries.fetch_add(1, Ordering::Relaxed);
-            return false;
+            let slow = metrics.consecutive_slow.fetch_add(1, Ordering::Relaxed) + 1;
+            if slow < SLOW_REFRESHES_BEFORE_ACCEPTING {
+                metrics.rejected_queries.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
         }
+        self.record_uncertainty(metrics);
+        true
+    }
+
+    fn record_uncertainty(&self, metrics: &ClockMetrics) {
+        metrics.consecutive_slow.store(0, Ordering::Relaxed);
         metrics.uncertainty_us.store(
             self.elapsed.as_micros().div_ceil(2) as u64,
             Ordering::Relaxed,
         );
-        true
     }
 }
 
@@ -78,19 +90,41 @@ fn initial_sample(
     tick_rate: u64,
     metrics: &ClockMetrics,
 ) -> Result<ClockReading, Error> {
+    let mut best: Option<ClockReading> = None;
     for _ in 0..STARTUP_SAMPLE_ATTEMPTS {
         let reading = sample(reader, tick_rate)?;
-        if reading.accept(metrics) {
-            return Ok(reading);
+        metrics
+            .max_refresh_us
+            .fetch_max(reading.elapsed.as_micros() as u64, Ordering::Relaxed);
+        let fast = reading.elapsed <= MAX_QUERY_DURATION;
+        if !fast {
+            metrics.rejected_queries.fetch_add(1, Ordering::Relaxed);
+        }
+        if best
+            .as_ref()
+            .is_none_or(|best| reading.elapsed < best.elapsed)
+        {
+            best = Some(reading);
+        }
+        if fast {
+            break;
         }
     }
-    Err(Error::new(
-        ErrorKind::Timeout,
-        format!(
-            "device clock initialization: no query completed within {} us after {STARTUP_SAMPLE_ATTEMPTS} attempts",
-            MAX_QUERY_DURATION.as_micros()
-        ),
-    ))
+    let best = best.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Timeout,
+            "device clock initialization: no query completed",
+        )
+    })?;
+    if best.elapsed > MAX_QUERY_DURATION {
+        log::warn!(
+            "radiod: no device clock query completed within {} us after {STARTUP_SAMPLE_ATTEMPTS} attempts, using the fastest at {} us",
+            MAX_QUERY_DURATION.as_micros(),
+            best.elapsed.as_micros()
+        );
+    }
+    best.record_uncertainty(metrics);
+    Ok(best)
 }
 
 impl ClockSampler {
@@ -208,16 +242,42 @@ mod tests {
     }
 
     #[test]
-    fn initialization_fails_when_no_clock_query_has_bounded_uncertainty() {
+    fn initialization_uses_the_fastest_query_when_none_meets_the_limit() {
         let reader = DelayedClock {
             calls: AtomicUsize::new(0),
             always_slow: true,
         };
-        let error = initial_sample(&reader, TEST_TICK_RATE, &ClockMetrics::default())
-            .err()
-            .unwrap();
-        assert_eq!(error.kind(), ErrorKind::Timeout);
+        let metrics = ClockMetrics::default();
+        let reading = initial_sample(&reader, TEST_TICK_RATE, &metrics).unwrap();
         assert_eq!(reader.calls.load(Ordering::SeqCst), STARTUP_SAMPLE_ATTEMPTS);
+        assert!(reading.elapsed > MAX_QUERY_DURATION);
+        assert_eq!(
+            metrics.uncertainty_us.load(Ordering::Relaxed),
+            reading.elapsed.as_micros().div_ceil(2) as u64
+        );
+    }
+
+    #[test]
+    fn a_run_of_slow_refreshes_is_accepted_and_a_fast_one_restarts_the_count() {
+        let metrics = ClockMetrics::default();
+        let slow = ClockReading {
+            ticks: 0,
+            elapsed: MAX_QUERY_DURATION * 3,
+        };
+        for _ in 1..SLOW_REFRESHES_BEFORE_ACCEPTING {
+            assert!(!slow.accept(&metrics));
+        }
+        assert!(slow.accept(&metrics));
+        assert!(!slow.accept(&metrics));
+        let fast = ClockReading {
+            ticks: 0,
+            elapsed: MAX_QUERY_DURATION / 2,
+        };
+        assert!(fast.accept(&metrics));
+        for _ in 1..SLOW_REFRESHES_BEFORE_ACCEPTING {
+            assert!(!slow.accept(&metrics));
+        }
+        assert!(slow.accept(&metrics));
     }
 
     #[test]

@@ -80,6 +80,10 @@ required-features = ["tools"]
 name = "iq_roundtrip"
 required-features = ["memory"]
 
+[[example]]
+name = "gps_pps_probe"
+required-features = ["uhd-backend", "tools"]
+
 [[test]]
 name = "network_loopback"
 required-features = ["daemon"]

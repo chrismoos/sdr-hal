@@ -605,6 +605,48 @@ impl Usrp {
         Ok(time)
     }
 
+    /// Device time latched at the most recent PPS edge of the selected time source.
+    /// `mboard` is the motherboard index, 0 for a single device.
+    pub fn get_time_last_pps(&self, mboard: usize) -> Result<TimeSpec, Error> {
+        let mut time = TimeSpec::default();
+        let mut seconds: i64 = 0;
+        // SAFETY: Native handles and argument buffers remain live for this synchronous FFI call.
+        check_status(unsafe {
+            uhd_sys::uhd_usrp_get_time_last_pps(
+                self.0,
+                mboard as _,
+                &mut seconds,
+                &mut time.fraction,
+            )
+        })?;
+        time.seconds = seconds;
+        Ok(time)
+    }
+
+    /// Reads a motherboard sensor and returns its value as text. A GPS sensor can
+    /// block for about a second while it waits for the receiver.
+    pub fn get_mboard_sensor(&self, name: &str, mboard: usize) -> Result<String, Error> {
+        let name = CString::new(name)?;
+        let mut sensor: uhd_sys::uhd_sensor_value_handle = ptr::null_mut();
+        // SAFETY: `sensor` is a valid out pointer for the new handle.
+        check_status(unsafe { uhd_sys::uhd_sensor_value_make(&mut sensor) })?;
+        // SAFETY: Native handles and argument buffers remain live for this synchronous FFI call.
+        let read = check_status(unsafe {
+            uhd_sys::uhd_usrp_get_mboard_sensor(self.0, name.as_ptr(), mboard as _, &mut sensor)
+        })
+        .and_then(|()| {
+            // SAFETY: `sensor` holds the value the call above filled in.
+            copy_string(|buffer, length| unsafe {
+                uhd_sys::uhd_sensor_value_value(sensor, buffer, length as _)
+            })
+        });
+        // SAFETY: `sensor` was made above and is freed once.
+        let freed = check_status(unsafe { uhd_sys::uhd_sensor_value_free(&mut sensor) });
+        let value = read?;
+        freed?;
+        Ok(value)
+    }
+
     /// Sets the current clock source
     pub fn set_clock_source(&self, source: &str, mboard: usize) -> Result<(), Error> {
         let source = CString::new(source)?;

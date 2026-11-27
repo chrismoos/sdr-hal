@@ -50,9 +50,18 @@ fn block_id_is_newer(candidate: u32, reference: u32) -> bool {
 }
 
 /// Commands for the TX worker. Each reply returns the driver result.
+/// What a radio reports about its own time: its reference, when it tracks one, and the
+/// state of its clock when that is disciplined.
+pub type RadioTimeReference = (
+    Result<Option<crate::TimeReference>, Error>,
+    Option<crate::ClockStatus>,
+);
+
 pub enum TxCommand {
     /// Replies with the TX clock in device ticks.
     GetHardwareTime(oneshot::Sender<Result<u64, Error>>),
+    /// Replies with the time reference and clock status the radio itself reports.
+    GetTimeReference(oneshot::Sender<RadioTimeReference>),
     /// Resets the backend clock.
     SetHardwareTime {
         /// New device-clock value in ticks.
@@ -994,6 +1003,9 @@ impl TxBridge {
                 match cmds.try_recv() {
                     Ok(TxCommand::GetHardwareTime(reply)) => {
                         let _ = reply.send(device_time(&*tx, clock_cache.as_ref()));
+                    }
+                    Ok(TxCommand::GetTimeReference(reply)) => {
+                        let _ = reply.send((tx.time_reference(), tx.clock_status()));
                     }
                     Ok(TxCommand::SetHardwareTime { time_ticks, reply }) => {
                         let _ = reply.send(tx.set_hardware_time(time_ticks));

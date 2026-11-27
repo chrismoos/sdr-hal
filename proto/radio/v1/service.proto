@@ -35,6 +35,9 @@ service RadioControlService {
   rpc GetHardwareTime(google.protobuf.Empty) returns (HardwareTime);
   // Resets device time in ticks if the backend supports it.
   rpc SetHardwareTime(HardwareTime) returns (google.protobuf.Empty);
+  // Returns the time at one device tick. Every client of this server receives the same
+  // reference for as long as the device clock keeps its epoch and rate.
+  rpc GetTimeReference(google.protobuf.Empty) returns (GetTimeReferenceResponse);
   // Enables or stops TX. Optional time support depends on the backend.
   rpc EnableTransmit(EnableTransmitRequest) returns (google.protobuf.Empty);
   // Activates RX at an optional device time. Unsupported scheduled activation returns an error.
@@ -204,6 +207,87 @@ message OpenSessionResponse {
 message HardwareTime {
   // Device-clock ticks.
   uint64 time_ticks = 1;
+}
+
+// Where a time reference got its time.
+enum TimeReferenceSource {
+  // No source is stated.
+  TIME_REFERENCE_SOURCE_UNSPECIFIED = 0;
+  // The server host's UTC clock, paired with a device clock read.
+  TIME_REFERENCE_SOURCE_HOST_CLOCK = 1;
+  // A GPS receiver and its PPS.
+  TIME_REFERENCE_SOURCE_GPS = 2;
+}
+
+// Lock state of a time reference source.
+enum TimeReferenceLock {
+  // No lock state is stated.
+  TIME_REFERENCE_LOCK_UNSPECIFIED = 0;
+  // The source is locked.
+  TIME_REFERENCE_LOCK_LOCKED = 1;
+  // The source lost lock and the device clock is free-running.
+  TIME_REFERENCE_LOCK_HOLDOVER = 2;
+  // The source has never locked.
+  TIME_REFERENCE_LOCK_UNLOCKED = 3;
+}
+
+// The time at one device clock tick.
+message TimeReference {
+  // Device clock value the time below applies to.
+  uint64 device_ticks = 1;
+  // Whole seconds since 1980-01-06T00:00:00 at device_ticks.
+  uint64 seconds = 2;
+  // Nanoseconds past seconds.
+  uint32 subsecond_ns = 3;
+  // The reported time minus UTC, in seconds. Zero for a host-clock reference.
+  uint32 leap_seconds = 4;
+  // Where the time came from.
+  TimeReferenceSource source = 5;
+  // Lock state of the source.
+  TimeReferenceLock lock = 6;
+  // Half the width of the interval the true time lies in, in nanoseconds.
+  uint64 uncertainty_ns = 7;
+}
+
+// State of a device clock disciplined to an external reference.
+message ClockStatus {
+  // Rate of the device oscillator relative to the reference, in parts per
+  // billion. Positive means the oscillator runs fast.
+  double rate_error_ppb = 1;
+  // How far the last reference pulse was from its expected time, in nanoseconds.
+  double phase_error_ns = 2;
+  // Reference pulses accepted since tracking started.
+  uint64 accepted_pulses = 3;
+  // Reference pulses rejected as too far from their expected time.
+  uint64 rejected_pulses = 4;
+  // Whether the reference receiver reports a fix.
+  bool receiver_fix = 5;
+  // Satellites the reference receiver uses, when it reports the count.
+  optional uint32 satellites = 6;
+  // The time of the receiver's most recent report, in Unix seconds.
+  optional double receiver_unix_seconds = 7;
+  // Latitude of the last position the receiver reported with a fix, in degrees
+  // north.
+  optional double latitude_deg = 8;
+  // Longitude of that position, in degrees east.
+  optional double longitude_deg = 9;
+  // Meters above mean sea level.
+  optional double altitude_m = 10;
+  // Horizontal dilution of precision of the receiver's fix.
+  optional double hdop = 11;
+  // Whether the clock loop has settled on its slow gains.
+  bool settled = 12;
+  // Spread of the applied rate correction around its trend over the last
+  // minute, in parts per billion RMS.
+  optional double rate_stability_ppb = 13;
+}
+
+// Time reference of the server's device. Absent when the server tracks none.
+message GetTimeReferenceResponse {
+  // The reference shared by every client of this server.
+  optional TimeReference reference = 1;
+  // Present when the device clock is disciplined to an external reference.
+  optional ClockStatus clock_status = 2;
 }
 
 // TX stream enable or stop request with optional scheduling metadata.

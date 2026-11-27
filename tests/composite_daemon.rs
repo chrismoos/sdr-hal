@@ -889,6 +889,36 @@ fn a_fractional_rx_bandwidth_is_accepted() {
 }
 
 #[test]
+fn every_client_receives_the_same_time_reference() {
+    let state = Arc::new(Mutex::new(DeviceState::default()));
+    let (_server, control) = start_server(state);
+    let (first, _) = open_client(control, LOW_TX_HZ, LOW_RX_HZ, false);
+    let first_reference = first
+        .time_reference()
+        .expect("time reference")
+        .expect("the server tracks a reference");
+    assert_eq!(first_reference.source, sdr_hal::ReferenceSource::HostClock);
+    assert_eq!(first_reference.lock, sdr_hal::ReferenceLock::Locked);
+    assert_eq!(first_reference.leap_seconds, 0);
+
+    // A client that joins later, and the clock reader of either, see the same pair.
+    std::thread::sleep(Duration::from_millis(150));
+    let (second, _) = open_client(control, HIGH_TX_HZ, HIGH_RX_HZ, false);
+    assert_eq!(second.time_reference().unwrap(), Some(first_reference));
+    let reader = second.clock_reader().expect("network clock reader");
+    assert_eq!(reader.time_reference().unwrap(), Some(first_reference));
+    assert_eq!(first.time_reference().unwrap(), Some(first_reference));
+
+    // The pair states the host time of one device tick.
+    let device_now = first.get_hardware_time().expect("device time");
+    let elapsed_ticks = device_now - first_reference.device_ticks;
+    assert!(
+        elapsed_ticks < TICK_RATE * 5,
+        "the reference is {elapsed_ticks} ticks old"
+    );
+}
+
+#[test]
 fn a_client_clock_request_is_ignored_and_answered_with_the_device_clock() {
     let state = Arc::new(Mutex::new(DeviceState::default()));
     let (_server, control) = start_server(state);

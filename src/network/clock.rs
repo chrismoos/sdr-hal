@@ -18,9 +18,19 @@ pub struct NetworkClock {
     floor_ticks: AtomicU64,
     anchor_seq: AtomicU64,
     writer: Mutex<()>,
+    /// Clock status sent with the server's last time reference.
+    clock_status: Mutex<Option<crate::ClockStatus>>,
 }
 
 impl NetworkClock {
+    pub(crate) fn set_clock_status(&self, status: Option<crate::ClockStatus>) {
+        *self.clock_status.lock() = status;
+    }
+
+    pub(crate) fn clock_status(&self) -> Option<crate::ClockStatus> {
+        *self.clock_status.lock()
+    }
+
     /// Anchors local elapsed time to `server_ticks` at construction.
     pub fn new(tick_rate: u64, server_ticks: u64) -> Self {
         let clock = Self {
@@ -30,6 +40,7 @@ impl NetworkClock {
             floor_ticks: AtomicU64::new(server_ticks),
             anchor_seq: AtomicU64::new(0),
             writer: Mutex::new(()),
+            clock_status: Mutex::new(None),
         };
         clock.offset_ticks.store(
             offset_for(server_ticks, clock.local_ticks()),
